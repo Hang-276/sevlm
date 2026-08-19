@@ -1,0 +1,53 @@
+{
+  "reward_scalarization": "configured_weighted_sum",
+  "version": "2",
+  "weights": {
+    "answer": 0.6,
+    "grounding": 0.25,
+    "process": 0.05,
+    "consistency": 0.07,
+    "budget": 0.03
+  },
+  "routing_thresholds": {
+    "positive_min_grounding": 0.2,
+    "positive_min_process": 0.4
+  },
+  "components": {
+    "answer": {
+      "mode": "structured_fields",
+      "fields": {
+        "spy": 0.7,
+        "changed_attributes": 0.3
+      },
+      "off_by_one_credit": 0.25,
+      "graded_fields": [
+        "changed_attributes"
+      ]
+    },
+    "grounding": {
+      "format_credit": 0.0,
+      "player_id_credit": 0.1,
+      "iou_credit": 0.9,
+      "match_mode": "f1",
+      "iou_threshold": 0.1,
+      "coordinate_mode": "auto",
+      "warmup_steps": 0
+    },
+    "consistency": {
+      "mode": "field_consistency"
+    },
+    "budget": {
+      "fallback_tokens": 400
+    },
+    "gating": {
+      "mode": "spy",
+      "floor": 0.0,
+      "dims": [
+        "grounding",
+        "process",
+        "consistency"
+      ]
+    }
+  },
+  "notes": "answer is scored per field (spy / changed_attributes) so a collapsed count cannot hide behind a correct spy. grounding pays overlap only (no unconditional format floor) and uses box-F1 so extra boxes cost; warmup_steps=0 keeps that pressure on from the first step. consistency checks the trajectory against itself rather than against its rollout group, which is constant within a group and therefore has no gradient. gating=spy: the auxiliary dims pay only on rollouts that identified the outlier image."
+}

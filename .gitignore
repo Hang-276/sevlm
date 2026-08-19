@@ -1,0 +1,28 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+tmp/
+src/open-r1-multimodal/tmp/
+
+# self-evolve local outputs
+tmp/
+outputs/
+checkpoints/
+wandb/
+runs/
+*.log
+
+# model/data artifacts
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.tar
+*.zip
+
+# secrets
+.env
+*.key
+*api_key*
+*secret*

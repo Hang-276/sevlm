@@ -1,0 +1,16 @@
+{
+  "reward_scalarization": "configured_weighted_sum",
+  "version": "outcome_only_v1",
+  "weights": {
+    "answer": 1.0,
+    "grounding": 0.0,
+    "process": 0.0,
+    "consistency": 0.0,
+    "budget": 0.0
+  },
+  "routing_thresholds": {
+    "positive_min_grounding": 0.3,
+    "positive_min_process": 0.5
+  },
+  "notes": "Outcome-only reward for the 'ours w/o process-level reward' ablation and the pure-GRPO baseline: answer=1.0, all other dims (incl. process=0.15 from default) zeroed. Weights still sum to 1.0 (loader does NOT auto-normalize). routing_thresholds kept identical to default so only the scalar weighting changes."
+}

@@ -1,0 +1,10 @@
+{
+  "_comment1": "HF Trainer --fsdp_config for Qwen2.5-VL full-parameter GRPO. Selected via `--fsdp \"full_shard auto_wrap\"` + `--fsdp_config <this>`.",
+  "_comment2": "CRITICAL: transformers 4.49 only exports a subset of these keys to accelerate as FSDP_* env vars, and does NOT export fsdp version or state_dict_type. The launcher (_launch in run_real_input_self_evolve_loop.py) MUST export FSDP_VERSION=2 (else silently runs FSDP1) and FSDP_STATE_DICT_TYPE=FULL_STATE_DICT (else FSDP2 defaults to SHARDED_STATE_DICT and checkpoints can't be loaded by from_pretrained for carry-forward/eval).",
+  "transformer_layer_cls_to_wrap": ["Qwen2_5_VLDecoderLayer", "Qwen2_5_VLVisionBlock"],
+  "use_orig_params": true,
+  "sync_module_states": true,
+  "cpu_ram_efficient_loading": false,
+  "activation_checkpointing": false,
+  "limit_all_gathers": true
+}
