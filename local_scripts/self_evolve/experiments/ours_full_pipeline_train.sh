@@ -219,7 +219,7 @@ load_env
 
 # ---- RUN_TAG（固定名，不带时间戳；OUT_DIR 存在则自动两级续跑）----
 # 起新实验：换名字（新目录自然从头跑）。强制重头跑同目录：SELF_EVOLVE_DISABLE_RESUME=1。
-RUN_TAG="${RUN_TAG:-ours}"
+RUN_TAG="${RUN_TAG:-ours_0824_newcode}"
 OUT_DIR="$RUNS_ROOT/$RUN_TAG"
 mkdir -p "$OUT_DIR"
 

@@ -36,7 +36,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
+import tempfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -1062,6 +1064,7 @@ def run_proposer_stage(
     seed: int,
     solver_min_pixels: Optional[int] = None,
     solver_max_pixels: Optional[int] = None,
+    num_gpus: int = 1,
     log: Any,
 ) -> Dict[str, Any]:
     """Let the model choose which changes to keep — the proposing half of self-play.
@@ -1167,11 +1170,6 @@ def run_proposer_stage(
                                                 "source": "enumerated_no_model"},
                 "source": "enumerated_no_model"}
 
-    from open_r1.self_evolve.online_solver import (
-        OnlineTransformersSolverSampler,
-        OnlineSolveConfig,
-    )
-
     effective = solver_model_path or base_model_path
     if not effective:
         raise SystemExit(
@@ -1179,46 +1177,70 @@ def run_proposer_stage(
         )
     log(f"  Proposer: sampling {config.group_size} proposal(s) for "
         f"{len(prompts)} scene(s) from {effective}.")
-    sampler = OnlineTransformersSolverSampler(
-        OnlineSolveConfig(
-            model_path=effective,
-            dry_run=False,
+    # Data-parallel over all cards: one task per scene, group_size generations
+    # each, sharded round-robin across GPUs — same engine as the solver rollout.
+    # Each worker's generate_one uses config.seed + gen_index for its per-sample
+    # seed, so passing seed=seed reproduces the old serial seed+g exactly.
+    from open_r1.self_evolve.online_solver import generate_rollouts_multi_gpu
+
+    prompt_by_scene = {str(item["scene_id"]): item for item in prompts}
+    proposer_tasks = [
+        {
+            "task_id": f"propose::{item['scene_id']}",
+            "image_path": list(item["image_path"]),
+            "prompt": item["prompt"],
+            "metadata": {"role": "proposer", "scene_id": str(item["scene_id"])},
+            "scene_id": str(item["scene_id"]),
+        }
+        for item in prompts
+    ]
+
+    scratch_dir = tempfile.mkdtemp(prefix="proposer_rollout_")
+    try:
+        trajectories = generate_rollouts_multi_gpu(
+            proposer_tasks,
+            num_generations=config.group_size,
+            effective_solver_path=effective,
+            num_gpus=max(1, int(num_gpus)),
+            scratch_dir=scratch_dir,
             max_new_tokens=config.max_new_tokens,
             temperature=config.temperature,
             top_p=0.95,
+            seed=seed,
             min_pixels=solver_min_pixels,
             max_pixels=solver_max_pixels,
+            rollout_source="proposer",
+            log=log,
         )
-    )
-    try:
-        for item in prompts:
-            for g in range(config.group_size):
-                traj = sampler.generate_one(
-                    task_id=f"propose::{item['scene_id']}",
-                    image_paths=list(item["image_path"]),
-                    prompt_text=item["prompt"],
-                    metadata={"role": "proposer", "scene_id": item["scene_id"]},
-                    gen_index=g,
-                    seed=seed + g,
-                    diagnostic_only=False,
-                    rollout_source="proposer",
-                )
-                completion = traj.get("completion") or ""
-                pick = parse_proposal(completion, item["num_objects"],
-                                      config.min_players, config.max_players)
-                proposals.append({
-                    "proposal_id": f"{item['scene_id']}::p{g}",
-                    "scene_id": item["scene_id"],
-                    "prompt": item["prompt"],
-                    "image_path": item["image_path"],
-                    "completion": completion,
-                    "keep": pick["keep"] if pick else None,
-                    "num_players": pick["num_players"] if pick else None,
-                    "proposal_source": "proposer",
-                })
     finally:
-        # Free the VRAM before the solver rollout reloads the same weights.
-        sampler.unload()
+        shutil.rmtree(scratch_dir, ignore_errors=True)
+
+    # Reassemble proposals from (scene_id, gen_index). Keyed lookup rather than
+    # positional zip: the multi-GPU concat is in shard order, not prompt order.
+    completions: Dict[str, str] = {}
+    for traj in trajectories:
+        scene_id = str((traj.get("metadata") or {}).get("scene_id")
+                       or traj.get("scene_id") or "")
+        g = int((traj.get("generation_info") or {}).get("gen_index", 0))
+        completions[f"{scene_id}::p{g}"] = traj.get("completion") or ""
+
+    # Rebuild in the original prompt/gen order so downstream ids stay stable.
+    for item in prompts:
+        scene_id = str(item["scene_id"])
+        for g in range(config.group_size):
+            completion = completions.get(f"{scene_id}::p{g}", "")
+            pick = parse_proposal(completion, item["num_objects"],
+                                  config.min_players, config.max_players)
+            proposals.append({
+                "proposal_id": f"{scene_id}::p{g}",
+                "scene_id": item["scene_id"],
+                "prompt": item["prompt"],
+                "image_path": item["image_path"],
+                "completion": completion,
+                "keep": pick["keep"] if pick else None,
+                "num_players": pick["num_players"] if pick else None,
+                "proposal_source": "proposer",
+            })
 
     tagged = tag_counterfactual_pairs(proposals)
     parsed = sum(1 for p in tagged if p.get("keep"))
@@ -2173,6 +2195,10 @@ def run_one_iteration(
                 seed=args.seed,
                 solver_min_pixels=args.solver_min_pixels,
                 solver_max_pixels=args.solver_max_pixels,
+                num_gpus=(
+                    int(os.environ.get("SELF_EVOLVE_SOLVER_NUM_GPUS", 0))
+                    or int(getattr(args, "trainer_num_gpus", 1) or 1)
+                ),
                 log=log,
             )
             proposals = proposer_stage["proposals"]

@@ -468,6 +468,7 @@ def _rollout_worker(
     progress_position: int,
     min_pixels: Optional[int] = None,
     max_pixels: Optional[int] = None,
+    rollout_source: str = "real_solver",
 ) -> None:
     """Worker: roll out one task shard on a single GPU, stream to out_path."""
     import json as _json
@@ -496,7 +497,7 @@ def _rollout_worker(
     total = len(shard_tasks) * num_generations
     pbar = tqdm(
         total=total,
-        desc=f"solver gpu{gpu_id}",
+        desc=f"{rollout_source} gpu{gpu_id}",
         unit="traj",
         position=progress_position,
         dynamic_ncols=True,
@@ -514,7 +515,7 @@ def _rollout_worker(
                     metadata={**task.get("metadata", {}), "self_evolve_task": task},
                     gen_index=g,
                     diagnostic_only=False,
-                    rollout_source="real_solver",
+                    rollout_source=rollout_source,
                 )
                 traj["problem"] = task.get("problem")
                 traj["prompt"] = task.get("prompt") or task.get("problem")
@@ -523,7 +524,7 @@ def _rollout_worker(
                 traj["scene_id"] = task.get("scene_id")
                 traj["base_task_id"] = task.get("base_task_id")
                 traj["reference_reasoning"] = task.get("reference_reasoning")
-                traj["rollout_source"] = "real_solver"
+                traj["rollout_source"] = rollout_source
                 traj["solver_model_path"] = effective_solver_path
                 fh.write(_json.dumps(traj, ensure_ascii=False) + "\n")
                 fh.flush()
@@ -545,6 +546,7 @@ def generate_rollouts_multi_gpu(
     seed: int = 42,
     min_pixels: Optional[int] = None,
     max_pixels: Optional[int] = None,
+    rollout_source: str = "real_solver",
     log: Any = print,
 ) -> List[Dict[str, Any]]:
     """Data-parallel rollout across ``num_gpus`` cards.
@@ -581,7 +583,7 @@ def generate_rollouts_multi_gpu(
         for r in range(num_gpus)
     ]
 
-    log(f"  Solver: data-parallel rollout over {num_gpus} GPU(s) "
+    log(f"  {rollout_source}: data-parallel rollout over {num_gpus} GPU(s) "
         f"(gpu_ids={gpu_ids}); shard sizes={[len(s) for s in shards]}")
 
     # spawn (not fork): each worker gets a clean CUDA context. Explicit Process
@@ -607,6 +609,7 @@ def generate_rollouts_multi_gpu(
                 r,  # progress bar position
                 min_pixels,
                 max_pixels,
+                rollout_source,
             ),
         )
         p.start()
