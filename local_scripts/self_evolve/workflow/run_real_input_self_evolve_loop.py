@@ -35,6 +35,7 @@ is present in the environment.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -342,6 +343,9 @@ def run_reference_stage(
     generator_policy: Dict[str, Any],
     failure_profile: Optional[Dict[str, Any]],
     max_regenerate_attempts: int,
+    stream_dir: Optional[str] = None,
+    max_workers: int = 16,
+    progress_every: int = 16,
     log: Any,
 ) -> Dict[str, Any]:
     """Judge-until-quota Reference VLM stage.
@@ -386,79 +390,136 @@ def run_reference_stage(
     budget_exhausted = False
     generator_exhausted = False
 
+    # Streaming sidecar writers: append each judgment the moment it lands so the
+    # stage is tailable and crash-resumable-by-inspection. These are ".partial"
+    # files, NOT the canonical accepted_tasks.jsonl / reference_feedback.jsonl —
+    # the call site writes those atomically at end-of-stage, so a crash here
+    # never leaves a half-written canonical file that the resume gate would
+    # mistake for a completed stage.
+    _acc_fh = None
+    _fb_fh = None
+    if stream_dir:
+        os.makedirs(stream_dir, exist_ok=True)
+        _acc_fh = open(os.path.join(stream_dir, "accepted_tasks.partial.jsonl"), "w")
+        _fb_fh = open(os.path.join(stream_dir, "reference_feedback.partial.jsonl"), "w")
+
+    def _stream(fh, record: Dict[str, Any]) -> None:
+        if fh is None:
+            return
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        fh.flush()
+
+    # I/O-bound judge (network round-trip per task) → thread pool. The GIL is
+    # released across the request, so threads overlap the waits. Bookkeeping
+    # (accept/reject, counters, streaming) stays on this thread, applied to each
+    # wave's results IN ORDER, so the sequence is deterministic and lock-free.
+    effective_workers = max(1, int(max_workers))
+
     pending = list(first_batch)
     for t in pending:
         seen_scene_ids.add(t.get("scene_id"))
     attempt = 0
 
-    while True:
-        for task in pending:
-            if len(accepted) >= quota_target:
-                break
-            if num_judged >= judge_budget:
-                budget_exhausted = True
-                break
-            judgment = judge(task)
-            num_judged += 1
-            num_api_calls += 0 if dry_run else 1
-            if judgment is None:
-                # Reference VLM API failed after retries — skip this task, keep
-                # training running. Bookkeeping mirrors a rejected task so the
-                # scene isn't re-proposed in this iteration.
-                rejected_scene_ids.add(task.get("scene_id"))
-                reject_reason_counter["reference_api_error"] = (
-                    reject_reason_counter.get("reference_api_error", 0) + 1
-                )
-                stub_judgment = {
-                    "accepted": False,
-                    "reject_reason": "reference_api_error",
-                    "reference_provider": provider,
-                    "reference_model": model,
-                    "reference_source": f"{provider}_reference_vlm",
-                }
-                fb = _make_feedback_record(task, stub_judgment, attempt)
-                fb["status"] = "reference_api_error"
-                feedback.append(fb)
-                continue
-            record = dict(task)
-            record["reference_judge"] = judgment
-            fb = _make_feedback_record(task, judgment, attempt)
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _apply_result(task: Dict[str, Any], judgment: Optional[Dict[str, Any]]) -> None:
+        """Bookkeeping + streaming for one judged task. Called on THIS thread,
+        in submission order, so counters/lists stay deterministic and lock-free."""
+        if judgment is None:
+            # Reference VLM API failed after retries — skip this task, keep
+            # training running. Bookkeeping mirrors a rejected task so the
+            # scene isn't re-proposed in this iteration.
+            rejected_scene_ids.add(task.get("scene_id"))
+            reject_reason_counter["reference_api_error"] = (
+                reject_reason_counter.get("reference_api_error", 0) + 1
+            )
+            stub_judgment = {
+                "accepted": False,
+                "reject_reason": "reference_api_error",
+                "reference_provider": provider,
+                "reference_model": model,
+                "reference_source": f"{provider}_reference_vlm",
+            }
+            fb = _make_feedback_record(task, stub_judgment, attempt)
+            fb["status"] = "reference_api_error"
             feedback.append(fb)
-            if judgment.get("accepted"):
-                accepted.append(record)
-            else:
-                rejected_scene_ids.add(task.get("scene_id"))
-                rr = judgment.get("reject_reason") or "unspecified"
-                reject_reason_counter[rr] = reject_reason_counter.get(rr, 0) + 1
-                fb["status"] = "reference_rejected"
+            _stream(_fb_fh, fb)
+            return
+        record = dict(task)
+        record["reference_judge"] = judgment
+        fb = _make_feedback_record(task, judgment, attempt)
+        feedback.append(fb)
+        if judgment.get("accepted"):
+            accepted.append(record)
+            _stream(_acc_fh, record)
+        else:
+            rejected_scene_ids.add(task.get("scene_id"))
+            rr = judgment.get("reject_reason") or "unspecified"
+            reject_reason_counter[rr] = reject_reason_counter.get(rr, 0) + 1
+            fb["status"] = "reference_rejected"
+        _stream(_fb_fh, fb)
 
-        if len(accepted) >= quota_target or budget_exhausted:
-            break
-        if generator is None or attempt >= max_regenerate_attempts:
-            break
+    try:
+        with ThreadPoolExecutor(max_workers=effective_workers) as pool:
+            while True:
+                # Judge `pending` in waves of `effective_workers`. Between waves
+                # re-check quota/budget; a wave is clamped to the remaining
+                # budget so it stays a hard cap (we may judge up to wave_size-1
+                # extra past the exact quota hit — harmless under oversampling).
+                idx = 0
+                while idx < len(pending):
+                    if len(accepted) >= quota_target:
+                        break
+                    room = judge_budget - num_judged
+                    if room <= 0:
+                        budget_exhausted = True
+                        break
+                    wave = pending[idx: idx + min(effective_workers, room)]
+                    idx += len(wave)
+                    # Concurrent network round-trips; results collected in order.
+                    judgments = list(pool.map(judge, wave))
+                    for task, judgment in zip(wave, judgments):
+                        num_judged += 1
+                        num_api_calls += 0 if dry_run else 1
+                        _apply_result(task, judgment)
+                    log(f"  Reference VLM: judged {num_judged}/{judge_budget}, "
+                        f"accepted {len(accepted)}/{quota_target} "
+                        f"(x{effective_workers} concurrent).")
 
-        attempt += 1
-        remaining_budget = judge_budget - num_judged
-        if remaining_budget <= 0:
-            budget_exhausted = True
-            break
-        regenerated = generator.generate(
-            generator_policy, failure_profile, exclude_scene_ids=seen_scene_ids
-        )
-        regenerated = [
-            t for t in regenerated if t.get("scene_id") not in seen_scene_ids
-        ]
-        if not regenerated:
-            generator_exhausted = True
-            log(f"  Regenerate attempt {attempt}: generator exhausted "
-                f"(no unseen scenes left); stopping short of quota.")
-            break
-        for t in regenerated:
-            seen_scene_ids.add(t.get("scene_id"))
-        num_regenerated += len(regenerated)
-        log(f"  Regenerate attempt {attempt}: {len(regenerated)} new candidate(s) "
-            f"(accepted={len(accepted)}/{quota_target}, judged={num_judged}/{judge_budget}).")
-        pending = regenerated
+                if len(accepted) >= quota_target or budget_exhausted:
+                    break
+                if generator is None or attempt >= max_regenerate_attempts:
+                    break
+
+                attempt += 1
+                remaining_budget = judge_budget - num_judged
+                if remaining_budget <= 0:
+                    budget_exhausted = True
+                    break
+                regenerated = generator.generate(
+                    generator_policy, failure_profile, exclude_scene_ids=seen_scene_ids
+                )
+                regenerated = [
+                    t for t in regenerated if t.get("scene_id") not in seen_scene_ids
+                ]
+                if not regenerated:
+                    generator_exhausted = True
+                    log(f"  Regenerate attempt {attempt}: generator exhausted "
+                        f"(no unseen scenes left); stopping short of quota.")
+                    break
+                for t in regenerated:
+                    seen_scene_ids.add(t.get("scene_id"))
+                num_regenerated += len(regenerated)
+                log(f"  Regenerate attempt {attempt}: {len(regenerated)} new candidate(s) "
+                    f"(accepted={len(accepted)}/{quota_target}, judged={num_judged}/{judge_budget}).")
+                pending = regenerated
+    finally:
+        for _fh in (_acc_fh, _fb_fh):
+            if _fh is not None:
+                try:
+                    _fh.close()
+                except Exception:
+                    pass
 
     quota_shortfall = max(0, quota_target - len(accepted))
     if quota_shortfall > 0:
@@ -2238,6 +2299,8 @@ def run_one_iteration(
                 generator_policy=policy,
                 failure_profile=prev_failure_profile,
                 max_regenerate_attempts=args.max_regenerate_attempts,
+                stream_dir=str(iter_dir),
+                max_workers=int(os.environ.get("SELF_EVOLVE_REFERENCE_CONCURRENCY", 16)),
                 log=log,
             )
         else:

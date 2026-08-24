@@ -113,7 +113,7 @@ TRAINER_BACKEND="${TRAINER_BACKEND:-deepspeed}"
 
 # Reference VLM（出题把关，live 需 .env 里的 key）
 REFERENCE_PROVIDER="${REFERENCE_PROVIDER:-openai}"
-REFERENCE_MODEL="${REFERENCE_MODEL:-qwen3.8-max}"
+REFERENCE_MODEL="${REFERENCE_MODEL:-qwen3.7-plus}"
 # ← 完整方法用默认 reward（五维加权）。
 REWARD_JSON="${REWARD_JSON:-$REPO/local_scripts/self_evolve/configs/reward/reward_weights.json}"
 # answer-judge 每题采样多少条 rollout 送判；必须 = NUM_GENERATIONS 才能判全每条。
