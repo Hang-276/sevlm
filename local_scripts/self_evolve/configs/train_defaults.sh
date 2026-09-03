@@ -23,7 +23,9 @@
 : "${GRPO_MAX_PROMPT_LEN:=10240}"
 # The library default is 256: a five-image comparison CoT doesn't fit, and the
 # trailing <bbox> block is what gets truncated first — so set this explicitly.
-: "${GRPO_MAX_COMPLETION_LEN:=1024}"
+# 2048 matches the ours full-pipeline script so the baseline's rollouts are
+# truncated no more than ours (fair comparison).
+: "${GRPO_MAX_COMPLETION_LEN:=2048}"
 # Resolution the solver sees. Pick it with
 # experiments/analysis/perception_probe.sh for your model and image pool; the
 # library default is far too low for these scenes. Raising it also raises

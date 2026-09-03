@@ -76,6 +76,7 @@ fi
 # CLEVR 数据根：指向 output/ 的父目录（不是 output/ 本身）。
 DATASET_ROOT="${DATASET_ROOT:-$WORKSPACE/data/Vision-Zero-clevr-dataset}"
 BASE_MODEL="${BASE_MODEL:-$WORKSPACE/Qwen2.5-VL-7B-Instruct}"
+# BASE_MODEL="${BASE_MODEL:-$WORKSPACE/self_evolve_runs/ours_0824_newcode_iter1/iter_000/checkpoints/grpo_qwen2_5_vl/checkpoint-90}"
 RUNS_ROOT="${RUNS_ROOT:-$WORKSPACE/self_evolve_runs}"
 # Reference VLM API（仅 live 模式需要；训练本身不需要）。改用阿里云百炼 bailian 的
 # OpenAI 兼容端点 + Qwen 模型（原 GPT-4o）。GPU 机无外网，请求经 SELF_EVOLVE_PROXY
@@ -95,8 +96,8 @@ FSDP_CONFIG="$REPO/local_scripts/fsdp2_qwen2_5vl.json"
 # 2) 超参（原 train_defaults.sh）。每项都可用 env 覆盖。
 # =============================================================================
 # ---- 主实验协议（主表所有 exp 必须一致；改这里就改了训练预算）----
-LOOP_ITERATIONS="${LOOP_ITERATIONS:-1}"                 # self-evolve 轮数（出题-筛选-解题-打分-训练）
-GRPO_STEPS_PER_ITER="${GRPO_STEPS_PER_ITER:-320}"       # 每轮 GRPO 步数
+LOOP_ITERATIONS="${LOOP_ITERATIONS:-2}"                 # self-evolve 轮数（出题-筛选-解题-打分-训练）
+GRPO_STEPS_PER_ITER="${GRPO_STEPS_PER_ITER:-120}"       # 每轮 GRPO 步数
 MAIN_NUM_GENERATIONS="${MAIN_NUM_GENERATIONS:-8}"      # GRPO group size / solver rollout n
 MAIN_NUM_TRAIN_TASKS="${MAIN_NUM_TRAIN_TASKS:-256}"     # 每轮筛选前生成的候选题目数
 
@@ -106,14 +107,21 @@ NUM_GENERATIONS="${NUM_GENERATIONS:-$MAIN_NUM_GENERATIONS}"
 SEED="${SEED:-42}"
 MAX_STEPS="${MAX_STEPS:-60}"                            # 兜底/默认步数（未单独指定的阶段用它；也用于 banner/wandb 命名）
 NUM_GPUS="${NUM_GPUS:-8}"
-PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-8}"
-GRAD_ACCUM="${GRAD_ACCUM:-1}"
+PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-2}"
+GRAD_ACCUM="${GRAD_ACCUM:-8}"
 
 TRAINER_BACKEND="${TRAINER_BACKEND:-deepspeed}"
 
-# Reference VLM（出题把关，live 需 .env 里的 key）
+# Reference VLM（出题把关，live 需 .env 里的 key）。看图判题目质量（可解/歧义/难度），
+# 必须是真能读图的 VLM，用较强的 qwen3.7-plus。
 REFERENCE_PROVIDER="${REFERENCE_PROVIDER:-openai}"
 REFERENCE_MODEL="${REFERENCE_MODEL:-qwen3.7-plus}"
+# Answer-judge（GRPO 打分时兜 exact-match 判答案对错）走另一条链路：纯文本、无图，
+# 只做答案语义等价判断，用更快更省的 qwen3.6-flash 即可。url/key 与 Reference 共用
+# .env 里的 OPENAI_BASE_URL / OPENAI_API_KEY（同一百炼端点），只有模型不同。
+# 解析优先级见 rewards.py:_resolve_answer_judge_endpoint：REFERENCE_VLM_MODEL 优先于
+# .env 的 OPENAI_MODEL，故下面 export 即可覆盖，且不影响 Reference VLM（它吃 --reference-model 参数）。
+ANSWER_JUDGE_MODEL="${ANSWER_JUDGE_MODEL:-qwen3.6-flash}"
 # ← 完整方法用默认 reward（五维加权）。
 REWARD_JSON="${REWARD_JSON:-$REPO/local_scripts/self_evolve/configs/reward/reward_weights.json}"
 # answer-judge 每题采样多少条 rollout 送判；必须 = NUM_GENERATIONS 才能判全每条。
@@ -130,11 +138,11 @@ GRPO_WARMUP_RATIO="${GRPO_WARMUP_RATIO:-0.1}"
 GRPO_LR_SCHEDULER="${GRPO_LR_SCHEDULER:-cosine}"
 GRPO_BETA="${GRPO_BETA:-0.06}"                           # KL 系数
 GRPO_WEIGHT_DECAY="${GRPO_WEIGHT_DECAY:-0.0}"
-GRPO_TEMPERATURE="${GRPO_TEMPERATURE:-0.6}"              # rollout 采样温度
+GRPO_TEMPERATURE="${GRPO_TEMPERATURE:-1.0}"              # rollout 采样温度
 GRPO_MAX_PROMPT_LEN="${GRPO_MAX_PROMPT_LEN:-10240}"      # 要放得下 num_players 张图 + prompt 文本
 GRPO_MAX_COMPLETION_LEN="${GRPO_MAX_COMPLETION_LEN:-2048}"  # 库默认 256 放不下五图对比 CoT + 尾部 <bbox>
-GRPO_MIN_PIXELS="${GRPO_MIN_PIXELS:-802816}"             # 1024*28*28（solver 看到的分辨率，用 perception_probe 定）
-GRPO_MAX_PIXELS="${GRPO_MAX_PIXELS:-1003520}"            # 1280*28*28
+GRPO_MIN_PIXELS="${GRPO_MIN_PIXELS:-802816}"            # 256*28*28（降分辨率省显存：视觉 attention 是全量 SDPA，8 图叠加时 seq² 会 OOM）
+GRPO_MAX_PIXELS="${GRPO_MAX_PIXELS:-1003520}"            # 640*28*28（原 1280 太高，8-player 题 visual attention 爆到 ~1.6TB；CLEVR 物体在此分辨率仍可辨）
 GRPO_SCALE_REWARDS="${GRPO_SCALE_REWARDS:-False}"        # Dr.GRPO：减组均值但不除 std
 GRPO_OVERLONG_FILTERING="${GRPO_OVERLONG_FILTERING:-True}"  # 被 max_completion_length 截断（无 EOS）的 rollout 给 0 advantage
 GRPO_DYNAMIC_SAMPLING="${GRPO_DYNAMIC_SAMPLING:-True}"
@@ -231,6 +239,8 @@ export SELF_EVOLVE_ANSWER_JUDGE="${SELF_EVOLVE_ANSWER_JUDGE:-1}"
 export SELF_EVOLVE_ANSWER_JUDGE_LIVE="${SELF_EVOLVE_ANSWER_JUDGE_LIVE:-1}"
 export SELF_EVOLVE_ANSWER_JUDGE_FORCE="${SELF_EVOLVE_ANSWER_JUDGE_FORCE:-0}"
 export SELF_EVOLVE_ANSWER_JUDGE_SAMPLE_N="${SELF_EVOLVE_ANSWER_JUDGE_SAMPLE_N:-$ANSWER_JUDGE_SAMPLE_N}"
+# Answer-judge 专用模型（覆盖 .env 的 OPENAI_MODEL；不影响 Reference VLM）。
+export REFERENCE_VLM_MODEL="${REFERENCE_VLM_MODEL:-$ANSWER_JUDGE_MODEL}"
 
 # GRPO 每-step 轨迹+打分落盘（默认开）。每 step 一个文件夹，8 卡各写各的 rankN.jsonl。
 # 关掉：export SELF_EVOLVE_GRPO_DUMP_DIR=（置空）。
@@ -240,12 +250,15 @@ export SELF_EVOLVE_GRPO_DUMP_DIR="${SELF_EVOLVE_GRPO_DUMP_DIR:-$OUT_DIR/grpo_dum
 export SELF_EVOLVE_GRPO_EXTRA_ARGS="$GRPO_EXTRA"
 export SELF_EVOLVE_SFT_EXTRA_ARGS="$SFT_EXTRA"
 
-# --- wandb 训练曲线（默认关；WANDB=1 打开，需 WANDB_API_KEY）---
-if [ "${WANDB:-0}" = "1" ]; then
+# --- wandb 训练曲线（默认开；WANDB=0 关闭。key 放 .env 的 WANDB_API_KEY）---
+if [ "${WANDB:-1}" = "1" ]; then
   export SELF_EVOLVE_REPORT_TO=wandb
   export WANDB_PROJECT="${WANDB_PROJECT:-self-evolve-vlm}"
   export WANDB_NAME="${WANDB_NAME:-ours_${NUM_ITERATIONS}iters_${MAX_STEPS}step}"
   : "${WANDB_API_KEY:?WANDB=1 需要 WANDB_API_KEY（放 $ENV_FILE 或先 wandb login）}"
+  # 跑前自动 login（幂等；已登录会直接复用）。失败不致命，训练照跑（离线缓存）。
+  wandb login --relogin "$WANDB_API_KEY" 2>/dev/null \
+    && echo "[wandb] logged in" || echo "[wandb] login skipped/failed（训练继续）" >&2
   echo "[wandb] project=$WANDB_PROJECT name=$WANDB_NAME"
 else
   export SELF_EVOLVE_REPORT_TO=none
@@ -324,7 +337,7 @@ banner "train  self-evolve loop（完整方法 ours，全链路：出题/self-pl
   CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES
   iters=$NUM_ITERATIONS tasks=$NUM_TRAIN_TASKS gen=$NUM_GENERATIONS steps=$MAX_STEPS gpus=$NUM_GPUS mode=FULL-PARAM(GRPO=$([ "$TRAINER_BACKEND" = fsdp2 ] && echo "fsdp2=$(basename "$FSDP_CONFIG")" || echo "deepspeed=$(basename "$DEEPSPEED_CONFIG")"); SFT=deepspeed=$(basename "$DEEPSPEED_CONFIG"))
   stages=$STAGES  (sft=$SFT_MAX_STEPS grpo=$GRPO_MAX_STEPS step)
-  reward=$REWARD_JSON  reference=$REFERENCE_MODEL(live)"
+  reward=$REWARD_JSON  reference=$REFERENCE_MODEL(live)  answer_judge=$REFERENCE_VLM_MODEL(live)"
 
 cd "$REPO"
 # resume 场景保留历史 log：append 而非覆盖（-a）。

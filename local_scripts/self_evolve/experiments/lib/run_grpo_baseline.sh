@@ -63,6 +63,23 @@ RUN_TAG="${EXP_NAME}_$(date +%Y%m%d_%H%M%S)"
 OUT_DIR="$EXP_RUNS_ROOT/$RUN_TAG"
 mkdir -p "$OUT_DIR"
 
+# --- wandb training curves (on by default, matching ours full-pipeline; WANDB=0
+# disables). The GRPO trainer reports standard TRL curves (loss/lr/grad_norm/
+# reward). Loop-level signals stay in run.log. Needs WANDB_API_KEY (in .env or a
+# prior `wandb login`). Auto-login before the run (idempotent; a failure is
+# non-fatal — training still runs and wandb caches offline). ---
+if [ "${WANDB:-1}" = "1" ]; then
+  export SELF_EVOLVE_REPORT_TO=wandb
+  export WANDB_PROJECT="${WANDB_PROJECT:-self-evolve-vlm}"
+  export WANDB_NAME="${WANDB_NAME:-${EXP_NAME}_${NUM_TRAIN_TASKS}t_${MAX_STEPS}step}"
+  : "${WANDB_API_KEY:?WANDB=1 needs WANDB_API_KEY (put it in $ENV_FILE or run wandb login first)}"
+  wandb login --relogin "$WANDB_API_KEY" 2>/dev/null \
+    && echo "[wandb] logged in" || echo "[wandb] login skipped/failed (training continues)" >&2
+  echo "[wandb] project=$WANDB_PROJECT name=$WANDB_NAME"
+else
+  export SELF_EVOLVE_REPORT_TO=none
+fi
+
 if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
   export CUDA_VISIBLE_DEVICES="$(seq -s, 0 $((NUM_GPUS-1)))"
 fi

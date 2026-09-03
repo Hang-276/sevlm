@@ -1,0 +1,21 @@
+{
+  "reward_scalarization": "configured_weighted_sum",
+  "version": "binary_outcome_v1",
+  "weights": {
+    "answer": 1.0,
+    "grounding": 0.0,
+    "process": 0.0,
+    "consistency": 0.0,
+    "budget": 0.0
+  },
+  "components": {
+    "answer": {
+      "mode": "exact_match"
+    }
+  },
+  "routing_thresholds": {
+    "positive_min_grounding": 0.3,
+    "positive_min_process": 0.5
+  },
+  "notes": "Pure-GRPO baseline reward: BINARY exact-match outcome only. answer=1.0, all other dims 0, and answer.mode=exact_match so the score is 0/1 (full 'spy=X; changed_attributes=Y' must match gold) via answer_reward — NOT the structured_fields graded/off-by-one scoring used by ours. Distinct from reward_outcome_only.json (which keeps ours' structured answer scoring and is the 'ours w/o process reward' ablation). Answer-judge stays off (script does not export SELF_EVOLVE_ANSWER_JUDGE), so reward is fully local, no API."
+}
