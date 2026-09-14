@@ -794,12 +794,12 @@ def run_solver_stage(
     ``replay_fallback`` if used.
     """
     if not dry_run:
-        # Real rollout path: the online Transformers VLM sampler.
+        # Real rollout path: the online vLLM sampler.
         # This loads a local Qwen2.5-VL model and generates real trajectories on
         # GPU. Gated by NOT passing --dry-run-solver; the sampler itself raises a
-        # clear error if transformers/qwen_vl_utils or the model are unavailable.
+        # clear error if vllm/transformers/qwen_vl_utils or the model are unavailable.
         from open_r1.self_evolve.online_solver import (
-            OnlineTransformersSolverSampler,
+            OnlineVLLMSolverSampler,
             OnlineSolveConfig,
             generate_rollouts_multi_gpu,
         )
@@ -852,9 +852,10 @@ def run_solver_stage(
         # --- Single-GPU / single-process fallback ---
         log(f"  Solver: REAL online rollout (single process) from "
             f"{effective_solver_path} [rollout_source=real_solver].")
-        sampler = OnlineTransformersSolverSampler(
+        sampler = OnlineVLLMSolverSampler(
             OnlineSolveConfig(
                 model_path=effective_solver_path,
+                max_images=max((len(t.get("image_path") or []) for t in accepted_tasks), default=1),
                 dry_run=False,
                 max_new_tokens=solver_max_new_tokens,
                 temperature=solver_temperature,

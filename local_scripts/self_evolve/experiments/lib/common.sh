@@ -209,6 +209,8 @@ PY
     echo "[judge] exact_matching (no API)" >&2
   fi
 
-  ( cd "$VLMK" && "$PY" run.py --config "$TMP_CFG" --work-dir "$WORK_DIR" --verbose "${JUDGE_ARGS[@]}" )
+  local RUN_ARGS=(--config "$TMP_CFG" --work-dir "$WORK_DIR" --verbose "${JUDGE_ARGS[@]}")
+  [ "${USE_VLLM:-1}" = "1" ] && RUN_ARGS+=(--use-vllm)
+  ( cd "$VLMK" && "$PY" run.py "${RUN_ARGS[@]}" )
   echo "[done] results in $WORK_DIR (per-model subdirectories; *_acc.csv holds the scores)" >&2
 }

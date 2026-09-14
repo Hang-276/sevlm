@@ -75,8 +75,7 @@ LABEL="${LABEL:-}"
 # missing ones run. Use DATASETS=... to run a subset.
 DATASETS="${DATASETS:-MMVP MMStar BLINK RealWorldQA AI2D_TEST ChartQA_TEST VStarBench MMMU_Pro_10c CV-Bench-2D CV-Bench-3D}"
 
-# --- Sampling (passed through to Qwen2VLChat; all effective on the default
-#     transformers backend) ---
+# --- Sampling (passed through to Qwen2VLChat) ---
 # Qwen2VLChat ships "near-greedy" defaults (top_p=0.001, top_k=1, temp=0.01,
 # do_sample=true); they're written out here so they're easy to tweak. For
 # strict greedy / reproducibility: DO_SAMPLE=false.
@@ -101,8 +100,8 @@ JUDGE="${JUDGE:-gpt-4o-mini}"
 #   infer : inference only, skip scoring (no judge / OPENAI_* needed; produces prediction files)
 #   eval  : score existing inference results (no re-inference)
 MODE="${MODE:-all}"
-# vLLM backend: USE_VLLM=1 passes --use-vllm to run.py (default: transformers).
-USE_VLLM="${USE_VLLM:-0}"
+# vLLM backend by default; USE_VLLM=0 selects Transformers.
+USE_VLLM="${USE_VLLM:-1}"
 # =============================================================================
 #  ^^^ Usually only the block above needs editing ^^^
 # =============================================================================

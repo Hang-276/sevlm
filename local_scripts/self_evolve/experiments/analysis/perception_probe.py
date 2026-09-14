@@ -48,11 +48,12 @@ def parse_args() -> argparse.Namespace:
 def evaluate(tasks, model_path, min_pixels, max_pixels, max_new_tokens, seed):
     from open_r1.self_evolve.online_solver import (
         OnlineSolveConfig,
-        OnlineTransformersSolverSampler,
+        OnlineVLLMSolverSampler,
     )
 
-    sampler = OnlineTransformersSolverSampler(OnlineSolveConfig(
+    sampler = OnlineVLLMSolverSampler(OnlineSolveConfig(
         model_path=model_path,
+        max_images=max((len(t.get("image_path") or []) for t in tasks), default=1),
         dry_run=False,
         max_new_tokens=max_new_tokens,
         temperature=0.0,          # greedy: this measures a ceiling, not diversity
@@ -80,6 +81,7 @@ def evaluate(tasks, model_path, min_pixels, max_pixels, max_new_tokens, seed):
         })
         if (i + 1) % 20 == 0:
             print(f"    {i + 1}/{len(tasks)}", flush=True)
+    sampler.unload()
     return rows
 
 

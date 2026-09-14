@@ -50,6 +50,12 @@ bash $E/experiments/main/ours.sh
 bash $E/experiments/main/eval.sh
 ```
 
+Online proposer/solver rollouts use vLLM 0.8.2 (installed by `setup.sh`);
+SFT and GRPO training still use PyTorch/Transformers. Rollout workers each
+load one model on one GPU, with the image limit set from the task shard and
+a 32768-token context. The standalone sampler defaults to 8 images.
+VLMEvalKit evaluation also defaults to vLLM (`USE_VLLM=0` switches it back).
+
 Training needs no API. Only the evaluation MCQ judge wants a key, and
 `JUDGE=exact_matching` scores locally instead.
 

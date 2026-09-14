@@ -63,7 +63,7 @@ _deps = [
     "torch>=2.5.1",
     "transformers==4.49.0",
     "trl==0.16.0",
-    "vllm==0.6.6.post1",
+    "vllm==0.8.2",
     "wandb>=0.19.1",
     "pillow",
 ]
@@ -104,6 +104,7 @@ install_requires = [
     deps["sentencepiece"],
     deps["transformers"],
     deps["trl"],
+    deps["vllm"],
 ]
 
 setup(
