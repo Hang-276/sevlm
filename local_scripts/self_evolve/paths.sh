@@ -8,21 +8,20 @@
 # --- Workspace root: data, models, outputs and evaluation all hang off it.
 #     Moving machines = changing this one line. ---
 # Can also be overridden from outside via export WORKSPACE=...
-WORKSPACE="${WORKSPACE:-/PATH/TO/WORKSPACE}"
+WORKSPACE="${WORKSPACE:-/jizhicfs/rtliu}"
 
 # --- Repo root. Derived from this file's location;
 #     rarely needs changing. ---
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 
-# --- Conda environment (the GPU box has vision-zero installed; flash-attn is
-#     skipped, the code uses sdpa) ---
+# --- Conda environment (this machine uses the sevlm environment) ---
 # Activate it directly so torchrun/python subprocesses inside training also
 # use this env (setting PY alone isn't enough).
 # CONDA_ENV must match the env you actually created — the repo's root setup.sh
 # suggests the name vlm-r1, so set CONDA_ENV=vlm-r1 (or export PY) if that's
 # what you used.
-CONDA_BASE="${CONDA_BASE:-$HOME/miniconda3}"
-CONDA_ENV="${CONDA_ENV:-vision-zero}"
+CONDA_BASE="${CONDA_BASE:-/jizhicfs/rtliu/miniconda3}"
+CONDA_ENV="${CONDA_ENV:-sevlm}"
 if [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
   # shellcheck disable=SC1091
   source "$CONDA_BASE/etc/profile.d/conda.sh"

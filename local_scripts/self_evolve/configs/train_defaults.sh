@@ -17,6 +17,12 @@
 : "${GRPO_BETA:=0.06}"                # KL coefficient
 : "${GRPO_WEIGHT_DECAY:=0.0}"
 : "${GRPO_TEMPERATURE:=1.0}"          # rollout temperature; lower = more homogeneous groups
+# Synchronous rollout on each training GPU; vLLM sleeps during parameter updates.
+: "${GRPO_USE_VLLM:=True}"
+: "${GRPO_VLLM_MEMORY_UTILIZATION:=0.35}"
+: "${GRPO_VLLM_MAX_MODEL_LEN:=32768}"
+: "${GRPO_VLLM_MAX_IMAGES:=8}"
+: "${GRPO_VLLM_MAX_NUM_SEQS:=4}"
 # Must hold num_players images at GRPO_MIN_PIXELS, plus the prompt text —
 # visual tokens are 28x28 pixels each. Too small and the images are silently
 # truncated; the loop warns at launch when the combination does not fit.
@@ -130,6 +136,10 @@ build_grpo_extra() {
        "--max_completion_length $GRPO_MAX_COMPLETION_LEN" \
        "--min_pixels $GRPO_MIN_PIXELS --max_pixels $GRPO_MAX_PIXELS" \
        "--weight_decay $GRPO_WEIGHT_DECAY --temperature $GRPO_TEMPERATURE" \
+       "--use_vllm $GRPO_USE_VLLM --vllm_device auto" \
+       "--vllm_gpu_memory_utilization $GRPO_VLLM_MEMORY_UTILIZATION" \
+       "--vllm_max_model_len $GRPO_VLLM_MAX_MODEL_LEN" \
+       "--vllm_max_images $GRPO_VLLM_MAX_IMAGES --vllm_max_num_seqs $GRPO_VLLM_MAX_NUM_SEQS" \
        "--scale_rewards $GRPO_SCALE_REWARDS" \
        "--overlong_filtering $GRPO_OVERLONG_FILTERING" \
        "--dynamic_sampling $GRPO_DYNAMIC_SAMPLING" \

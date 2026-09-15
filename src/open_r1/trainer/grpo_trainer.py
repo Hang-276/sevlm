@@ -46,7 +46,7 @@ from transformers.utils import is_peft_available
 
 from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
-from trl.trainer.grpo_config import GRPOConfig
+from .grpo_config import GRPOConfig
 from trl.trainer.utils import generate_model_card, get_comet_experiment_url
 # from trl import GRPOTrainer
 
@@ -309,6 +309,14 @@ class VLMGRPOTrainer(Trainer):
         
         assert isinstance(model, str), "model must be a string in the current implementation"
         model_id = model
+        self._rollout_model_id = model_id
+        self._vllm_rollout = None
+        self._vllm_generation_count = 0
+        self.use_vllm = args.use_vllm
+        if self.use_vllm and self.vlm_module.get_vlm_key() != "qwen":
+            raise ValueError("GRPO vLLM rollouts currently support Qwen2/2.5-VL; use_vllm=False for other VLMs.")
+        if self.use_vllm and args.vllm_device != "auto":
+            raise ValueError("GRPO vLLM shares each rank's training GPU. Set vllm_device=auto.")
         torch_dtype = model_init_kwargs.get("torch_dtype")
         if isinstance(torch_dtype, torch.dtype) or torch_dtype == "auto" or torch_dtype is None:
             pass  # torch_dtype is already a torch.dtype or "auto" or None
@@ -597,6 +605,64 @@ class VLMGRPOTrainer(Trainer):
             if isinstance(reward_func, PreTrainedModel):
                 self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
 
+    def train(self, *args, **kwargs):
+        try:
+            return super().train(*args, **kwargs)
+        finally:
+            if self._vllm_rollout is not None:
+                self._vllm_rollout.close()
+                self._vllm_rollout = None
+
+    def _generate_with_vllm(self, model, prompts_text, images_by_prompt, prompt_ids, prompt_mask):
+        from .vllm_rollout import ColocatedVLLMRollout, build_requests, completion_tensors
+
+        if self._vllm_rollout is None:
+            if self.is_fsdp_enabled and self.accelerator.state.fsdp_plugin.fsdp_version != 2:
+                raise ValueError("GRPO vLLM weight synchronization requires FSDP2, not FSDP1.")
+            image_processor = getattr(self.processing_class, "image_processor", None)
+            processor_kwargs = {
+                k: getattr(image_processor, k) for k in ("min_pixels", "max_pixels")
+                if getattr(image_processor, k, None) is not None
+            }
+            engine_kwargs = dict(
+                model=self._rollout_model_id,
+                dtype=self.args.vllm_dtype,
+                gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
+                max_model_len=self.args.vllm_max_model_len or 32768,
+                max_num_seqs=self.args.vllm_max_num_seqs,
+                limit_mm_per_prompt={"image": self.args.vllm_max_images},
+                mm_processor_kwargs=processor_kwargs,
+                enable_prefix_caching=self.args.vllm_enable_prefix_caching,
+                seed=self.args.seed + self.accelerator.process_index,
+            )
+            torch.cuda.empty_cache()
+            self._vllm_rollout = ColocatedVLLMRollout(
+                device_index=self.accelerator.device.index,
+                engine_kwargs=engine_kwargs,
+                log_path=os.path.join(self.args.output_dir, f"vllm_rank{self.accelerator.process_index}.log"),
+                timeout=self.args.vllm_worker_timeout,
+            )
+        sampling = dict(
+            n=1, max_tokens=self.max_completion_length,
+            temperature=self.args.temperature, top_p=self.args.top_p,
+            top_k=self.args.top_k if self.args.top_k is not None else -1,
+            min_p=self.args.min_p or 0.0, repetition_penalty=self.args.repetition_penalty,
+            seed=self.args.seed + self.accelerator.process_index * 1000003 + self._vllm_generation_count,
+            banned_token_ids=self._rollout_banned_token_ids,
+        )
+        if self.args.vllm_guided_decoding_regex is not None:
+            raise ValueError("Guided decoding is not supported by the synchronous GRPO rollout path.")
+        self._vllm_generation_count += 1
+        unwrapped = self.accelerator.unwrap_model(model)
+        outputs = self._vllm_rollout.generate(
+            unwrapped, self.state.global_step, build_requests(prompts_text, images_by_prompt), sampling,
+        )
+        expected = [ids[mask.bool()].tolist() for ids, mask in zip(prompt_ids, prompt_mask)]
+        result = completion_tensors(outputs, expected, self.processing_class.pad_token_id, prompt_ids.device)
+        self._metrics["rollout/vllm"].append(1.0)
+        self._metrics["rollout/policy_step"].append(float(self.state.global_step))
+        return result
+
     def _rollout_logits_processor(self) -> "LogitsProcessorList":
         """A fresh LogitsProcessorList carrying the A-3 finite-scrub + special-token
         ban, to attach to every rollout `generate` call (including the CLEVR
@@ -833,6 +899,7 @@ class VLMGRPOTrainer(Trainer):
         prompts_text = self.vlm_module.prepare_prompt(self.processing_class, inputs)
         # Handle both pre-loaded images and image paths
         images = []
+        images_by_prompt = []
         for x in inputs:
             if "image" in x:
                 imgs = self._get_key_from_inputs(x, "image")
@@ -841,6 +908,7 @@ class VLMGRPOTrainer(Trainer):
             else:
                 imgs = []
 
+            prompt_images = []
             for img in imgs:
                 try:
                     # Ensure minimum dimensions of 28 pixels
@@ -857,11 +925,15 @@ class VLMGRPOTrainer(Trainer):
                 except:
                     pass
                 images.append(img)
+                prompt_images.append(img)
+            images_by_prompt.append(prompt_images)
                 
 
         prompt_inputs = self.vlm_module.prepare_model_inputs(
             self.processing_class,
-            prompts_text,
+            # Qwen's HF processor expands image placeholders in this list in
+            # place. vLLM must receive the original, unexpanded chat prompts.
+            list(prompts_text),
             images,
             return_tensors="pt",
             padding=True,
@@ -906,22 +978,27 @@ class VLMGRPOTrainer(Trainer):
 
         # Generate completions. A-3: attach FiniteLogitsProcessor so a poisoned weight (non-finite
         # logits) degrades the rollout instead of crashing all ranks in multinomial sampling.
-        with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
-            generate_returned_result = unwrapped_model.generate(
-                **{k: v for k, v in prompt_inputs.items() if k not in self.vlm_module.get_non_generate_params()},
-                generation_config=self.generation_config,
-                logits_processor=self._rollout_logits_processor(),
-            )
+        if self.use_vllm:
             prompt_length = prompt_ids.size(1)
-            if not self.vlm_module.is_embeds_input():
-                prompt_completion_ids = generate_returned_result
-                prompt_ids = prompt_completion_ids[:, :prompt_length]
-                completion_ids = prompt_completion_ids[:, prompt_length:]
-            else:
-                # In this case, the input of the LLM backbone is the embedding of the combination of the image and text prompt
-                # So the returned result of the `generate` method only contains the completion ids
-                completion_ids = generate_returned_result
-                prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+            completion_ids, vllm_completion_mask, vllm_truncated = self._generate_with_vllm(
+                model, prompts_text, images_by_prompt, prompt_ids, prompt_mask,
+            )
+            prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        else:
+            with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
+                generate_returned_result = unwrapped_model.generate(
+                    **{k: v for k, v in prompt_inputs.items() if k not in self.vlm_module.get_non_generate_params()},
+                    generation_config=self.generation_config,
+                    logits_processor=self._rollout_logits_processor(),
+                )
+                prompt_length = prompt_ids.size(1)
+                if not self.vlm_module.is_embeds_input():
+                    prompt_completion_ids = generate_returned_result
+                    prompt_ids = prompt_completion_ids[:, :prompt_length]
+                    completion_ids = prompt_completion_ids[:, prompt_length:]
+                else:
+                    completion_ids = generate_returned_result
+                    prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
 
         # Mask everything after the first EOS token
         is_eos = completion_ids == self.processing_class.eos_token_id
@@ -929,6 +1006,8 @@ class VLMGRPOTrainer(Trainer):
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
         sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
         completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+        if self.use_vllm:
+            completion_mask = vllm_completion_mask
 
         # Concatenate prompt_mask with completion_mask for logit computation
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
@@ -1028,7 +1107,8 @@ class VLMGRPOTrainer(Trainer):
             )
         # A rollout cut off at max_completion_length has no </answer>, so its
         # near-zero reward reflects the length cap, not the reasoning.
-        truncated = self.accelerator.gather((~is_eos.any(dim=1)).int()).bool()
+        truncated_local = vllm_truncated if self.use_vllm else ~is_eos.any(dim=1)
+        truncated = self.accelerator.gather(truncated_local.int()).bool()
         self._metrics["truncated_fraction"].append(truncated.float().mean().item())
         if self.overlong_filtering:
             advantages = advantages * (~truncated).float()
@@ -3409,6 +3489,11 @@ class VLMGRPOTrainer(Trainer):
         #     print(f"[DEBUG] is_clevr_spotdiff: {is_clevr_spotdiff}")
         
         if is_clevr_spotdiff:
+            if self.use_vllm:
+                raise ValueError(
+                    "The legacy two-phase clevr_spotdiff trainer requires use_vllm=False. "
+                    "Use the self_evolve_refined_grpo task path for vLLM GRPO rollouts."
+                )
             # Handle CLEVR spot-the-difference two-phase training
             # if self.accelerator.process_index == 0:
             #     print("[DEBUG] Entering CLEVR spot-diff training path")

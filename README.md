@@ -50,8 +50,15 @@ bash $E/experiments/main/ours.sh
 bash $E/experiments/main/eval.sh
 ```
 
-Online proposer/solver rollouts use vLLM 0.8.2 (installed by `setup.sh`);
-SFT and GRPO training still use PyTorch/Transformers. Rollout workers each
+Online proposer/solver rollouts and the self-evolve GRPO trainer's generation
+step use vLLM 0.8.2 (installed by `setup.sh`). GRPO synchronizes the current
+policy weights before sampling, including LoRA deltas; rewards, log-probabilities,
+loss and optimizer updates still use PyTorch/Transformers. Each training rank
+runs vLLM synchronously on its own training GPU, then puts it to sleep to release
+GPU weights and KV cache before the training forward/backward pass. This needs
+no separate rollout node or reserved GPU. See [GRPO rollout configuration](local_scripts/self_evolve/docs/GRPO_VLLM.md).
+
+Outer-loop rollout workers each
 load one model on one GPU, with the image limit set from the task shard and
 a 32768-token context. The standalone sampler defaults to 8 images.
 VLMEvalKit evaluation also defaults to vLLM (`USE_VLLM=0` switches it back).

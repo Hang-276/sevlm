@@ -77,28 +77,25 @@ class GRPOConfig(TrainingArguments):
 
         > Parameters that control generation acceleration powered by vLLM
 
-        use_vllm (`bool`, *optional*, defaults to `False`):
-            Whether to use vLLM for generating completions. If set to `True`, ensure that a GPU is kept unused for
-            training, as vLLM will require one for generation. vLLM must be installed (`pip install vllm`).
+        use_vllm (`bool`, *optional*, defaults to `True`):
+            Generate GRPO completions synchronously with vLLM on the training GPU.
+            The engine sleeps during training updates.
         vllm_device (`str`, *optional*, defaults to `"auto"`):
-            Device where vLLM generation will run, e.g. `"cuda:1"`. If set to `"auto"` (default), the system will
-            automatically select the next available GPU after the last one used for training. This assumes that
-            training has not already occupied all available GPUs. If only one device is available, the device will be
-            shared between both training and vLLM.
-        vllm_gpu_memory_utilization (`float`, *optional*, defaults to `0.9`):
+            Must be `"auto"`: each training rank shares its GPU with its vLLM worker.
+        vllm_gpu_memory_utilization (`float`, *optional*, defaults to `0.35`):
             Ratio (between 0 and 1) of GPU memory to reserve for the model weights, activations, and KV cache on the
-            device dedicated to generation powered by vLLM. Higher values will increase the KV cache size and thus
+            device shared with training. Higher values will increase the KV cache size and thus
             improve the model's throughput. However, if the value is too high, it may cause out-of-memory (OOM) errors
             during initialization.
         vllm_dtype (`str`, *optional*, defaults to `"auto"`):
             Data type to use for vLLM generation. If set to `"auto"`, the data type will be automatically determined
             based on the model configuration. Find the supported values in the vLLM documentation.
-        vllm_max_model_len (`int` or `None`, *optional*, defaults to `None`):
+        vllm_max_model_len (`int` or `None`, *optional*, defaults to `32768`):
             If set, the `max_model_len` to use for vLLM. This could be useful when running with reduced
             `vllm_gpu_memory_utilization`, leading to a reduced KV cache size. If not set, vLLM will use the model
             context size, which might be much larger than the KV cache, leading to inefficiencies.
-        vllm_enable_prefix_caching (`bool`, *optional*, defaults to `True`):
-            Whether to enable prefix caching in vLLM. If set to `True` (default), ensure that the model and the hardware
+        vllm_enable_prefix_caching (`bool`, *optional*, defaults to `False`):
+            Whether to enable prefix caching in vLLM. If set to `True`, ensure that the model and the hardware
             support this feature.
         vllm_guided_decoding_regex (`str` or `None`, *optional*, defaults to `None`):
             Regex for vLLM guided decoding. If `None` (default), guided decoding is disabled.
@@ -267,26 +264,22 @@ class GRPOConfig(TrainingArguments):
 
     # Parameters that control generation acceleration powered by vLLM
     use_vllm: Optional[bool] = field(
-        default=False,
+        default=True,
         metadata={
-            "help": "Whether to use vLLM for generating completions. If set to `True`, ensure that a GPU is kept "
-            "unused for training, as vLLM will require one for generation. vLLM must be installed "
-            "(`pip install vllm`)."
+            "help": "Use synchronous vLLM GRPO rollouts on each rank's training GPU; the engine sleeps during updates."
         },
     )
     vllm_device: Optional[str] = field(
         default="auto",
         metadata={
-            "help": "Device where vLLM generation will run, e.g. 'cuda:1'. If set to 'auto' (default), the system "
-            "will automatically select the next available GPU after the last one used for training. This assumes "
-            "that training has not already occupied all available GPUs."
+            "help": "Use 'auto' to share each rank's training GPU. Dedicated rollout GPUs are not used."
         },
     )
     vllm_gpu_memory_utilization: float = field(
-        default=0.9,
+        default=0.35,
         metadata={
             "help": "Ratio (between 0 and 1) of GPU memory to reserve for the model weights, activations, and KV "
-            "cache on the device dedicated to generation powered by vLLM. Higher values will increase the KV cache "
+            "cache on the GPU shared with training. Higher values will increase the KV cache "
             "size and thus improve the model's throughput. However, if the value is too high, it may cause "
             "out-of-memory (OOM) errors during initialization."
         },
@@ -299,7 +292,7 @@ class GRPOConfig(TrainingArguments):
         },
     )
     vllm_max_model_len: Optional[int] = field(
-        default=None,
+        default=32768,
         metadata={
             "help": "If set, the `max_model_len` to use for vLLM. This could be useful when running with reduced "
             "`vllm_gpu_memory_utilization`, leading to a reduced KV cache size. If not set, vLLM will use the model "
@@ -307,7 +300,7 @@ class GRPOConfig(TrainingArguments):
         },
     )
     vllm_enable_prefix_caching: Optional[bool] = field(
-        default=True,
+        default=False,
         metadata={
             "help": "Whether to enable prefix caching in vLLM. If set to `True` (default), ensure that the model and "
             "the hardware support this feature."
@@ -317,6 +310,9 @@ class GRPOConfig(TrainingArguments):
         default=None,
         metadata={"help": "Regex for vLLM guided decoding. If `None` (default), guided decoding is disabled."},
     )
+    vllm_max_images: int = field(default=8, metadata={"help": "Maximum images per GRPO prompt."})
+    vllm_max_num_seqs: int = field(default=4, metadata={"help": "Concurrent sequences per rank's vLLM engine."})
+    vllm_worker_timeout: float = field(default=600, metadata={"help": "Timeout in seconds for a vLLM worker command."})
 
     # Parameters that control the training
     learning_rate: float = field(

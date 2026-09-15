@@ -57,6 +57,7 @@ _deps = [
     "math-verify",  # Used for math verification in grpo
     "packaging>=23.0",
     "parameterized>=0.9.0",
+    "peft==0.14.0",
     "pytest",
     "safetensors>=0.3.3",
     "sentencepiece>=0.1.99",
@@ -100,6 +101,7 @@ install_requires = [
     deps["huggingface-hub"],
     deps["liger_kernel"],
     deps["packaging"],  # utilities from PyPA to e.g., compare versions
+    deps["peft"],
     deps["safetensors"],
     deps["sentencepiece"],
     deps["transformers"],
