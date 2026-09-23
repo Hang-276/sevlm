@@ -5,6 +5,46 @@ import os
 import sys
 import traceback
 
+# vLLM's cumem_allocator abi3 wheel returns Py_None from python_create_and_map /
+# python_unmap_and_release WITHOUT incrementing its refcount: the inlined
+# Py_INCREF was compiled against Python 3.12+ headers, where None is immortal.
+# Every sleep/wake cycle therefore shaves None's refcount by one per call until
+# CPython aborts with "Fatal Python error: none_dealloc: deallocating None"
+# (~1300 cycles here, scaling with the number of sleep-mode handles). Python
+# 3.12 is immune by construction; under 3.11 keep the count far above the drain.
+_NONE_TOPPUP_SLACK = 100_000
+_toppup_broken = False
+
+
+def _none_refcount():
+    return sys.getrefcount(None)
+
+
+def _top_up_none_refcount(floor):
+    """Re-add the None references drained by the cumem leak; 0 if not needed."""
+    global _toppup_broken
+    if _toppup_broken:
+        return 0
+    missing = floor - _none_refcount()
+    if missing <= 0:
+        return 0
+    try:
+        import ctypes
+
+        incref = ctypes.pythonapi.Py_IncRef
+        incref.argtypes = [ctypes.py_object]
+        incref.restype = None
+        for _ in range(missing):
+            incref(None)
+    except Exception:
+        _toppup_broken = True
+        print(
+            f"[GRPO vLLM worker] none-refcount top-up disabled: {traceback.format_exc()}",
+            flush=True,
+        )
+        return 0
+    return missing
+
 
 class RolloutLogitsProcessor:
     def __init__(self, banned):
@@ -24,6 +64,9 @@ class RolloutLogitsProcessor:
 def main(fd):
     connection = Connection(fd)
     llm = None
+    none_floor = _none_refcount() + _NONE_TOPPUP_SLACK
+    commands = 0
+    topped_up = 0
     try:
         while True:
             command, payload = connection.recv()
@@ -76,6 +119,16 @@ def main(fd):
                 error = traceback.format_exc()
                 print(error, flush=True)
                 connection.send((False, error))
+            commands += 1
+            added = _top_up_none_refcount(none_floor)
+            if added:
+                topped_up += added
+            if added > _NONE_TOPPUP_SLACK // 10 or commands % 200 == 0:
+                print(
+                    f"[GRPO vLLM worker] command={commands} "
+                    f"none_refcount={_none_refcount()} topped_up_total={topped_up}",
+                    flush=True,
+                )
     except EOFError:
         pass
     finally:
