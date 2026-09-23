@@ -53,6 +53,7 @@ SE = {"grounding": {"gold_evidence_boxes": GOLD, "image_width": 320,
                     "image_height": 240, "valid_player_ids": [1, 2, 3, 4, 5]}}
 SOL = "<answer>spy=3; changed_attributes=2</answer>"
 CURRENT = str(CFG_DIR / "reward_weights.json")
+GRPO_BINARY = str(CFG_DIR / "baselines" / "grpo_binary_outcome.json")
 
 # The old scoring, synthesized in a temp file: whole-string answer match, no
 # outcome gate, recall grounding with unconditional format/player credit,
@@ -122,6 +123,17 @@ check("off-by-one credit applies to the count only, not the player id",
 r, _ = rw.structured_answer_reward(
     "<think>the answer is spy=3</think><answer>nonsense</answer>", SOL)
 check("numbers inside <think> cannot be mined for answer credit", r == 0.0)
+
+r, det = rw.structured_exact_match_reward(
+    "<answer>spy player: 3; changed attributes = 2</answer>", SOL)
+check("binary structured match tolerates harmless answer formatting", r == 1.0, det)
+
+r, det = rw.structured_exact_match_reward(
+    "<answer>spy=3; changed_attributes=1</answer>", SOL)
+check("binary structured match gives no partial or off-by-one credit", r == 0.0, det)
+
+r, det = rw.structured_exact_match_reward("<answer>spy=3</answer>", SOL)
+check("binary structured match requires every answer field", r == 0.0, det)
 
 # --------------------------------------------------------------------------
 print("grounding reward")
@@ -193,6 +205,20 @@ check("a config without a components block keeps the old semantics",
       cfg1.answer_cfg["mode"] == "exact_match"
       and cfg1.gating_cfg["mode"] == "none"
       and cfg1.grounding_cfg["match_mode"] == "recall")
+cfg_binary = rc.load_reward_config(GRPO_BINARY)
+check("GRPO baseline has a dedicated binary structured reward config",
+      cfg_binary.answer_cfg["mode"] == "structured_exact_match"
+      and cfg_binary.weights == {"answer": 1.0, "grounding": 0.0,
+                                 "process": 0.0, "consistency": 0.0,
+                                 "budget": 0.0})
+t_binary_ok, b_binary_ok = score(
+    "<answer>spy player: 3; changed attributes = 2</answer>", GRPO_BINARY)
+t_binary_bad, b_binary_bad = score(
+    "<answer>spy=3; changed_attributes=1</answer>", GRPO_BINARY)
+check("live GRPO baseline reward is exactly one for both correct fields",
+      t_binary_ok == 1.0 and b_binary_ok["answer_mode"] == "structured_exact_match")
+check("live GRPO baseline reward is exactly zero if either field is wrong",
+      t_binary_bad == 0.0 and b_binary_bad["answer"] == 0.0)
 try:
     rc._merge_components({"gating": {"dims": ["answer"]}}, "t")
     check("gating the answer on itself is rejected", False)

@@ -145,11 +145,12 @@ lengths, sampling, advantage handling, resolution, task generation). Both
 `lib/common.sh` and `../run_loop.sh` source it, so every exp starts from
 the same defaults. Change things there, not inside individual scripts.
 
-The reward config is `../configs/reward/reward_weights.json`;
-`lib/reward_outcome_only.json` is the outcome-only variant (used by
-`main/grpo_baseline.sh` and `main/ours_no_process.sh`). Ablation scripts
-patch the default config on the fly via `lib/patch_reward_config.py`, so
-there's no separate json per ablation exp.
+The main-method reward config is `../configs/reward/reward_weights.json`.
+`lib/reward_outcome_only.json` is reserved for the ours-without-process
+ablation. The plain GRPO baseline has its own binary config at
+`../configs/reward/baselines/grpo_binary_outcome.json`: it parses `spy` and
+`changed_attributes`, then returns 1 only when both match gold. Ablation
+scripts patch the default config on the fly via `lib/patch_reward_config.py`.
 
 Generation defaults to half edited, half freshly sampled. With `SELF_PLAY=1`
 (the default) the model itself picks which changes each edited task keeps;

@@ -23,6 +23,7 @@ from open_r1.self_evolve.rewards import (
     budget_reward,
     process_reward,
     structured_answer_reward,
+    structured_exact_match_reward,
     field_consistency_reward,
     parse_structured_answer,
     extract_answer,
@@ -168,13 +169,16 @@ def self_evolve_refined_reward(completions, **kwargs) -> List[float]:
         sol_text = sol if isinstance(sol, str) else f"<answer>{gold}</answer>"
 
         exact = answer_reward(comp, sol_text)
-        if cfg.answer_cfg["mode"] == "structured_fields":
+        answer_mode = cfg.answer_cfg["mode"]
+        if answer_mode == "structured_fields":
             a, a_det = structured_answer_reward(
                 comp, sol_text,
                 fields=cfg.answer_cfg["fields"],
                 off_by_one_credit=float(cfg.answer_cfg["off_by_one_credit"]),
                 graded_fields=cfg.answer_cfg["graded_fields"],
             )
+        elif answer_mode == "structured_exact_match":
+            a, a_det = structured_exact_match_reward(comp, sol_text)
         else:
             a, a_det = exact, {"answer_mode": "exact_match", "answer_fields": {}}
         pred_fields = parse_structured_answer(comp)

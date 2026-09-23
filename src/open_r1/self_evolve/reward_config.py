@@ -92,7 +92,11 @@ DEFAULT_COMPONENTS: Dict[str, Dict[str, Any]] = {
 }
 
 _COMPONENT_ENUMS = {
-    ("answer", "mode"): {"exact_match", "structured_fields"},
+    ("answer", "mode"): {
+        "exact_match",
+        "structured_exact_match",
+        "structured_fields",
+    },
     ("grounding", "match_mode"): {"recall", "f1"},
     ("grounding", "coordinate_mode"): {"normalized", "pixel", "auto"},
     ("consistency", "mode"): {"group_modal", "field_consistency"},

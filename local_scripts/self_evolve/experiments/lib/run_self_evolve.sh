@@ -15,14 +15,6 @@
 # =============================================================================
 set -euo pipefail
 
-# If the GPU box has no public egress, Reference-VLM / answer-judge calls go
-# through a proxy. Set SELF_EVOLVE_PROXY (e.g. socks5h://127.0.0.1:18080);
-# unset means direct connection.
-if [ -n "${SELF_EVOLVE_PROXY:-}" ]; then
-  export HTTPS_PROXY="$SELF_EVOLVE_PROXY" HTTP_PROXY="$SELF_EVOLVE_PROXY" \
-         ALL_PROXY="$SELF_EVOLVE_PROXY" NO_PROXY="localhost,127.0.0.1"
-fi
-
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
 # DATASET_ROOT / BASE_MODEL / RUNS_ROOT come from paths.sh; change them there

@@ -14,43 +14,19 @@
 # =============================================================================
 set -euo pipefail
 
-# ---------------- 跳板机联网（GPU 训练机无外网时借隧道出网 / wandb 上报）----------------
-# GPU 训练机没有公网出口。Reference-VLM/answer-judge 的 live 调用 + wandb 上报都要经一条
-# 反向 SOCKS 隧道出网。链路：GPU:28081 --(ssh -R)--> 本机CPU:11080 (socks5) --> 外网
-#
-# 【一次性：在有外网的本机 CPU 上把隧道起起来】
-#   1) 起 socks5 出口（stdlib，无依赖）：
-#        tmux new -d -s socks "python3 /tmp/socks5.py 11080"
-#   2) 建反向隧道，把 GPU 的 28081 转发到本机 socks5（tmux 常驻+自动重连）：
-#        tmux new -d -s tunnel "while true; do \
-#          ssh -N -R 28081:127.0.0.1:11080 -p 32283 \
-#            -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
-#            -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new \
-#            root@117.186.102.101; \
-#          echo \"[\$(date)] tunnel dropped, retry\"; sleep 5; \
-#        done"
-#   3) 在 GPU 机上验证（返回 200/401 即通）：
-#        curl -s -o /dev/null -w '%{http_code}\n' -x socks5h://127.0.0.1:28081 \
-#          https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/models
-#
-# 训练进程只要看到下面的 *_PROXY，openai/httpx/wandb 就会走隧道。默认端口 28081；
-# 换端口用 SELF_EVOLVE_PROXY 覆盖。GPU 机确有外网时可 export SELF_EVOLVE_PROXY= 置空走直连。
-export SELF_EVOLVE_PROXY="${SELF_EVOLVE_PROXY:-socks5h://127.0.0.1:28081}"
-if [ -n "${SELF_EVOLVE_PROXY:-}" ]; then
-  export HTTPS_PROXY="$SELF_EVOLVE_PROXY" HTTP_PROXY="$SELF_EVOLVE_PROXY" \
-         ALL_PROXY="$SELF_EVOLVE_PROXY" NO_PROXY="localhost,127.0.0.1"
-fi
-
 # =============================================================================
 # 1) 路径 + 环境（对齐 ours_full_pipeline_train.sh）。全部可用 env 覆盖。
 # =============================================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REPO:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
-WORKSPACE="${WORKSPACE:-$(cd "$REPO/.." && pwd)}"
+# This checkout lives at $WORKSPACE/self-vlm/sevlm on the current machine.
+# Keep WORKSPACE overridable so the script remains portable.
+WORKSPACE="${WORKSPACE:-/jizhicfs/rtliu}"
 
 # --- conda 环境 ---
-CONDA_BASE="${CONDA_BASE:-$HOME/miniconda3}"
-CONDA_ENV="${CONDA_ENV:-vision-zero}"
+CONDA_BASE="${CONDA_BASE:-/jizhicfs/rtliu/miniconda3}"
+CONDA_ENV="${CONDA_ENV:-sevlm}"
+WANDB_PKG_DIR="${WANDB_PKG_DIR:-/tmp/sevlm_wandb_py311}"
 if [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
   # shellcheck disable=SC1091
   source "$CONDA_BASE/etc/profile.d/conda.sh"
@@ -67,18 +43,21 @@ fi
 
 # --- 数据 / 模型 / 输出 / reward ---
 DATASET_ROOT="${DATASET_ROOT:-$WORKSPACE/data/Vision-Zero-clevr-dataset}"
-BASE_MODEL="${BASE_MODEL:-$WORKSPACE/Qwen2.5-VL-7B-Instruct}"
+BASE_MODEL="${BASE_MODEL:-$WORKSPACE/models/Qwen2.5-VL-7B-Instruct}"
 RUNS_ROOT="${RUNS_ROOT:-$WORKSPACE/self_evolve_runs}"
-# baseline 的 BINARY outcome reward（answer=1.0 其余置 0，且 answer.mode=exact_match → 0/1）。
-# 注意：不是 reward_outcome_only.json —— 那个仍走 ours 的 structured_fields 软分（spy0.7/attr0.3
-# +off-by-one），属于「ours w/o process reward」消融。pure-GRPO baseline 必须是二值 exact-match。
-REWARD_JSON="${REWARD_JSON:-$REPO/local_scripts/self_evolve/experiments/lib/reward_binary_outcome.json}"
+# Dedicated baseline reward: parse the two answer fields, then return 1 only
+# when BOTH match gold.  Main-method / ablation reward JSON files are untouched.
+REWARD_JSON="${REWARD_JSON:-$REPO/local_scripts/self_evolve/configs/reward/baselines/grpo_binary_outcome.json}"
 # API key 放 .env（gitignored），或直接 export；shell 里已 export 的永远优先。
 ENV_FILE="$REPO/.env"
 
 # --- 自动派生 ---
 export PYTHONPATH="$REPO/src:${PYTHONPATH:-}"
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# vLLM's colocated sleep-mode rollout uses CuMemAllocator. PyTorch expandable
+# segments are incompatible with that memory pool and make every worker abort
+# during vLLM initialization, before the first rollout.
+unset PYTORCH_CUDA_ALLOC_CONF
+unset PYTORCH_ALLOC_CONF
 LOOP_ENTRY="$REPO/local_scripts/self_evolve/workflow/run_real_input_self_evolve_loop.py"
 DEEPSPEED_CONFIG="$REPO/local_scripts/zero3.json"
 FSDP_CONFIG="$REPO/local_scripts/fsdp2_qwen2_5vl.json"
@@ -94,12 +73,15 @@ NUM_ITERATIONS="${NUM_ITERATIONS:-1}"
 MAX_STEPS="${MAX_STEPS:-2000}"                          # 单轮 GRPO 总步数（= ours 累计步数）
 # 题量：对齐 ours 整个 run 的累计题量（默认 10 轮 × 256 = 2560），单轮一次性出题。
 NUM_TRAIN_TASKS="${NUM_TRAIN_TASKS:-2560}"
+NUM_PLAYERS="${NUM_PLAYERS:-3}"
 NUM_GENERATIONS="${NUM_GENERATIONS:-8}"                 # GRPO group size；须 >=4 且整除 PER_DEVICE_BATCH*NUM_GPUS
 SEED="${SEED:-42}"
 NUM_GPUS="${NUM_GPUS:-8}"
-PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-2}"
-GRAD_ACCUM="${GRAD_ACCUM:-8}"
+PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-1}"
+GRAD_ACCUM="${GRAD_ACCUM:-16}"
 TRAINER_BACKEND="${TRAINER_BACKEND:-deepspeed}"
+# 1 = exercise the full data/export/command wiring without launching torchrun.
+DRY_RUN="${DRY_RUN:-0}"
 
 # ---- 训练阶段：baseline 只跑 GRPO（无 SFT）----
 STAGES="${STAGES:-grpo}"
@@ -114,7 +96,7 @@ GRPO_WEIGHT_DECAY="${GRPO_WEIGHT_DECAY:-0.0}"
 GRPO_TEMPERATURE="${GRPO_TEMPERATURE:-1.0}"             # rollout 采样温度（对齐改后的 ours）
 GRPO_MAX_PROMPT_LEN="${GRPO_MAX_PROMPT_LEN:-10240}"
 GRPO_MAX_COMPLETION_LEN="${GRPO_MAX_COMPLETION_LEN:-2048}"  # 对齐 ours（放得下五图 CoT + 尾部 <bbox>）
-GRPO_MIN_PIXELS="${GRPO_MIN_PIXELS:-200704}"           # 256*28*28
+GRPO_MIN_PIXELS="${GRPO_MIN_PIXELS:-602112}"            # 1024*28*28（4x）
 GRPO_MAX_PIXELS="${GRPO_MAX_PIXELS:-1003520}"           # 640*28*28
 GRPO_SCALE_REWARDS="${GRPO_SCALE_REWARDS:-False}"       # Dr.GRPO：减组均值不除 std
 GRPO_OVERLONG_FILTERING="${GRPO_OVERLONG_FILTERING:-True}"
@@ -154,7 +136,14 @@ banner() {
   echo "  $*"
   echo "======================================================"
 }
-load_env() { [ -f "$ENV_FILE" ] && { set -a; . "$ENV_FILE"; set +a; }; }
+load_env() {
+  if [ -f "$ENV_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    set +a
+  fi
+}
 require_paths() {
   case "$WORKSPACE" in */PATH/TO/*) echo "[ERROR] WORKSPACE 还是占位符，先填真实路径" >&2; exit 2;; esac
   [ -e "$DATASET_ROOT" ] || { echo "[ERROR] DATASET_ROOT 不存在: $DATASET_ROOT（先下 CLEVR 数据集）" >&2; exit 2; }
@@ -181,16 +170,27 @@ export SELF_EVOLVE_GRPO_DUMP_DIR="${SELF_EVOLVE_GRPO_DUMP_DIR:-$OUT_DIR/grpo_dum
 export SELF_EVOLVE_GRPO_EXTRA_ARGS="$GRPO_EXTRA"
 
 # 注意：不设置 SELF_EVOLVE_ANSWER_JUDGE* —— 取代码默认（关闭），reward 走本地
-# exact-match / structured-fields rubric，不联网。这正是 baseline 无需 CPU 隧道的原因。
+# local binary structured-answer rubric；默认仅 W&B 上报需要联网，由 GPU 机器直接访问。
 
 # --- wandb 训练曲线（默认开；WANDB=0 关闭。key 放 .env 的 WANDB_API_KEY）---
 if [ "${WANDB:-1}" = "1" ]; then
+  [ -d "$WANDB_PKG_DIR/wandb" ] || {
+    echo "[ERROR] W&B package not found: $WANDB_PKG_DIR/wandb" >&2
+    exit 2
+  }
+  # The conda env's bundled wandb is unusable on this machine. Always load the
+  # Python 3.11-compatible package staged under /tmp for both login and trainer.
+  export PYTHONPATH="$WANDB_PKG_DIR:$PYTHONPATH"
   export SELF_EVOLVE_REPORT_TO=wandb
   export WANDB_PROJECT="${WANDB_PROJECT:-self-evolve-vlm}"
   export WANDB_NAME="${WANDB_NAME:-base_grpo_${NUM_TRAIN_TASKS}t_${MAX_STEPS}step}"
-  : "${WANDB_API_KEY:?WANDB=1 需要 WANDB_API_KEY（放 $ENV_FILE 或先 wandb login）}"
-  wandb login --relogin "$WANDB_API_KEY" 2>/dev/null \
-    && echo "[wandb] logged in" || echo "[wandb] login skipped/failed（训练继续）" >&2
+  export WANDB_API_KEY="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"
+  echo "[wandb] package=$WANDB_PKG_DIR"
+  "$PY" -m wandb login --relogin "$WANDB_API_KEY" || {
+    echo "[ERROR] W&B login failed; refusing to start an untracked training run." >&2
+    exit 2
+  }
+  echo "[wandb] logged in"
   echo "[wandb] project=$WANDB_PROJECT name=$WANDB_NAME"
 else
   export SELF_EVOLVE_REPORT_TO=none
@@ -210,6 +210,7 @@ ARGS=(
   --reward-config "$REWARD_JSON"
   --num-iterations "$NUM_ITERATIONS"
   --num-train-tasks "$NUM_TRAIN_TASKS"
+  --num-players "$NUM_PLAYERS"
   --num-generations "$NUM_GENERATIONS"
   --seed "$SEED"
   --max-trainer-steps "$MAX_STEPS"
@@ -244,9 +245,13 @@ ARGS+=(--dry-run-reference-vlm)
 ARGS+=(--dry-run-solver)
 
 # --- 训练阶段（STAGES -> --execute-*-smoke）。baseline 只有 grpo。---
-case ",$STAGES," in *,sft,*)  ARGS+=(--execute-sft-smoke);; esac
-case ",$STAGES," in *,grpo,*) ARGS+=(--execute-grpo-smoke);; esac
 case ",$STAGES," in *grpo*) ;; *) echo "[ERROR] STAGES=$STAGES 不含 grpo（baseline 必须跑 grpo）" >&2; exit 2;; esac
+if [ "$DRY_RUN" = "1" ]; then
+  ARGS+=(--dry-run-trainer)
+else
+  case ",$STAGES," in *,sft,*)  ARGS+=(--execute-sft-smoke);; esac
+  case ",$STAGES," in *,grpo,*) ARGS+=(--execute-grpo-smoke);; esac
+fi
 
 # --- 后端 ---
 ARGS+=(--trainer-backend "$TRAINER_BACKEND")
@@ -260,8 +265,9 @@ banner "train  GRPO baseline（纯单轮 GRPO，无 self-evolve；出题 -> 本�
   RUN_TAG=$RUN_TAG
   OUT_DIR=$OUT_DIR
   CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES
+  dry_run=$DRY_RUN
   iters=$NUM_ITERATIONS tasks=$NUM_TRAIN_TASKS gen=$NUM_GENERATIONS steps=$MAX_STEPS gpus=$NUM_GPUS mode=FULL-PARAM(GRPO=$([ "$TRAINER_BACKEND" = fsdp2 ] && echo "fsdp2=$(basename "$FSDP_CONFIG")" || echo "deepspeed=$(basename "$DEEPSPEED_CONFIG")"))
-  stages=$STAGES  reward=$REWARD_JSON(outcome-only, 本地 rubric, 不联网)"
+  stages=$STAGES  reward=$REWARD_JSON(binary structured outcome, 本地 rubric, 不联网)"
 
 cd "$REPO"
 "$PY" "$LOOP_ENTRY" "${ARGS[@]}" 2>&1 | tee -a "$OUT_DIR/run.log"

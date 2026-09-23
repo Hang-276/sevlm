@@ -123,6 +123,43 @@ def parse_structured_answer(text: Optional[str]) -> Dict[str, Optional[int]]:
     return out
 
 
+def structured_exact_match_reward(
+    completion: str,
+    solution: str,
+) -> Tuple[float, Dict[str, Any]]:
+    """Binary outcome reward over the parsed answer fields.
+
+    Unlike whole-string ``answer_reward``, harmless formatting differences do
+    not change the score. Unlike ``structured_answer_reward``, partial or
+    off-by-one credit is never awarded: every required field must be present
+    and equal to gold for the trajectory to receive 1.
+    """
+    pred = parse_structured_answer(completion)
+    gold = parse_structured_answer(solution)
+    required_fields = tuple(_ANSWER_FIELD_RES)
+    field_correct = {
+        name: gold.get(name) is not None and pred.get(name) == gold.get(name)
+        for name in required_fields
+    }
+    score = float(all(field_correct.values()))
+    per_field = {
+        name: {
+            "pred": pred.get(name),
+            "gold": gold.get(name),
+            "credit": 1.0 if field_correct[name] else 0.0,
+        }
+        for name in required_fields
+    }
+    details = {
+        "answer_mode": "structured_exact_match",
+        "answer_fields": per_field,
+        "answer_parse_failed": [name for name in required_fields if pred.get(name) is None],
+        "gold_parse_failed": [name for name in required_fields if gold.get(name) is None],
+        "field_correct": field_correct,
+    }
+    return score, details
+
+
 def structured_answer_reward(
     completion: str,
     solution: str,
@@ -1368,13 +1405,16 @@ def compute_reward_vector(
     # Answer — same definition as the live reward: per-field when configured.
     _cfg = _active_reward_config()
     exact_match = answer_reward(completion, solution)
-    if _cfg.answer_cfg["mode"] == "structured_fields":
+    answer_mode = _cfg.answer_cfg["mode"]
+    if answer_mode == "structured_fields":
         answer, _answer_det = structured_answer_reward(
             completion, solution,
             fields=_cfg.answer_cfg["fields"],
             off_by_one_credit=float(_cfg.answer_cfg["off_by_one_credit"]),
             graded_fields=_cfg.answer_cfg["graded_fields"],
         )
+    elif answer_mode == "structured_exact_match":
+        answer, _answer_det = structured_exact_match_reward(completion, solution)
     else:
         answer, _answer_det = exact_match, {"answer_mode": "exact_match"}
 
@@ -1486,11 +1526,16 @@ def compute_reward_vector(
                     if answer_judge_result and answer_judge_result.get("answer_judge_used")
                     else "rule_based"
                 ),
-                "reason": (
-                    "per-field match against gold answer"
-                    if _answer_det.get("answer_mode") == "structured_fields"
-                    else "exact normalized string match against gold answer"
-                ) + ("" if not answer_judge_result
+                "reason": ({
+                    "structured_fields": "weighted per-field match against gold answer",
+                    "structured_exact_match": (
+                        "binary all-structured-fields match against gold answer"
+                    ),
+                    "exact_match": "exact normalized string match against gold answer",
+                }.get(
+                    _answer_det.get("answer_mode"),
+                    "answer match against gold answer",
+                )) + ("" if not answer_judge_result
                      else f"; judge_path={answer_judge_invoke_reason}"),
                 "answer_match": bool(answer_reward(completion, solution) >= 1.0),
                 "exact_match_result": bool(answer_reward(completion, solution) >= 1.0),

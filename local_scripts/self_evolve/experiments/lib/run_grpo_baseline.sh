@@ -8,7 +8,7 @@
 #   - single round (NUM_ITERATIONS=1), no cross-round carry-forward
 #   - GRPO stage only (STAGES=grpo)
 #   - Reference-VLM screening off (local dry-run heuristic, no GPT-4o call)
-#   - outcome-only reward (answer=1.0, see reward_outcome_only.json)
+#   - binary structured outcome reward (both answer fields must match)
 # Data is the same CLEVR source, so it stays comparable with ours.
 #
 # Hardware defaults assume 8x H200; edit the variable block at the top to
@@ -40,7 +40,7 @@ LORA_R=256; LORA_ALPHA=512; LORA_DROPOUT=0.05
 # Full-parameter by default, matching ours; MAIN_USE_LORA=1 switches to LoRA
 # (then it is no longer comparable with a full-parameter ours).
 DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-$REPO/local_scripts/zero3.json}"
-REWARD_JSON="${REWARD_JSON:-$LIB_DIR/reward_outcome_only.json}"   # outcome-based reward
+REWARD_JSON="${REWARD_JSON:-$SE_DIR/configs/reward/baselines/grpo_binary_outcome.json}"
 # ---------------------------------------------------------
 
 require_paths

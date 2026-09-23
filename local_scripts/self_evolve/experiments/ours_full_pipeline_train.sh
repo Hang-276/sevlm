@@ -16,35 +16,6 @@
 # =============================================================================
 set -euo pipefail
 
-# ---------------- 跳板机联网（GPU 训练机无外网时借隧道出网调 Reference-VLM）----------------
-# GPU 训练机没有公网出口，Reference-VLM / answer-judge 的 live 调用（阿里云百炼
-# token-plan 端点）要经一条反向 SOCKS 隧道出网。链路：
-#     GPU:28080  --(ssh -R 反向隧道)-->  cpu-cl-0:11080 (socks5 服务)  -->  外网
-#
-# 【一次性：在有外网的 CPU 跳板机 cpu-cl-0 上把隧道起起来】
-#   1) 跳板机上跑一个 socks5 出口（本机已用 /tmp/socks5.py，监听 11080）：
-#        tmux new -d -s socks "python3 /tmp/socks5.py 11080"
-#   2) 从跳板机建反向隧道，把 GPU 的 28080 转发到跳板机的 socks5（tmux 常驻+自动重连）：
-#        tmux new -d -s tunnel "while true; do \
-#          ssh -N -R 28080:127.0.0.1:11080 -p 32283 \
-#            -o ExitOnForwardFailure=yes \
-#            -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
-#            -o StrictHostKeyChecking=accept-new \
-#            root@117.186.102.101; \
-#          echo \"[\$(date)] tunnel dropped, retry in 5s\"; sleep 5; \
-#        done"
-#   3) 验证（在 GPU 机上）：应返回 200/401（能到端点即通）：
-#        curl -s -o /dev/null -w '%{http_code}\n' -x socks5h://127.0.0.1:28080 \
-#          https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/models
-#
-# 训练进程只要看到下面的 *_PROXY，openai/httpx 就会走隧道。默认端口 28080；换端口用
-# SELF_EVOLVE_PROXY 覆盖。GPU 机确有外网时可 export SELF_EVOLVE_PROXY= 置空走直连。
-export SELF_EVOLVE_PROXY="${SELF_EVOLVE_PROXY:-socks5h://127.0.0.1:28080}"
-if [ -n "${SELF_EVOLVE_PROXY:-}" ]; then
-  export HTTPS_PROXY="$SELF_EVOLVE_PROXY" HTTP_PROXY="$SELF_EVOLVE_PROXY" \
-         ALL_PROXY="$SELF_EVOLVE_PROXY" NO_PROXY="localhost,127.0.0.1"
-fi
-
 # =============================================================================
 # 1) 路径 + 环境（原 paths.sh）。全部可用 env 覆盖。
 # =============================================================================
@@ -54,9 +25,9 @@ REPO="${REPO:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
 # WORKSPACE = 数据/模型/输出的根，默认就是 sevlm 的上一级目录。
 WORKSPACE="${WORKSPACE:-$(cd "$REPO/.." && pwd)}"
 
-# --- conda 环境（GPU 机上装的是 vision-zero；无 flash-attn，代码走 sdpa）---
-CONDA_BASE="${CONDA_BASE:-$HOME/miniconda3}"
-CONDA_ENV="${CONDA_ENV:-vision-zero}"
+# --- conda 环境（GPU 机上使用 sevlm；无 flash-attn，代码走 sdpa）---
+CONDA_BASE="${CONDA_BASE:-/jizhicfs/rtliu/miniconda3}"
+CONDA_ENV="${CONDA_ENV:-sevlm}"
 if [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
   # shellcheck disable=SC1091
   source "$CONDA_BASE/etc/profile.d/conda.sh"
@@ -78,9 +49,8 @@ DATASET_ROOT="${DATASET_ROOT:-$WORKSPACE/data/Vision-Zero-clevr-dataset}"
 BASE_MODEL="${BASE_MODEL:-$WORKSPACE/Qwen2.5-VL-7B-Instruct}"
 # BASE_MODEL="${BASE_MODEL:-$WORKSPACE/self_evolve_runs/ours_0824_newcode_iter1/iter_000/checkpoints/grpo_qwen2_5_vl/checkpoint-90}"
 RUNS_ROOT="${RUNS_ROOT:-$WORKSPACE/self_evolve_runs}"
-# Reference VLM API（仅 live 模式需要；训练本身不需要）。改用阿里云百炼 bailian 的
-# OpenAI 兼容端点 + Qwen 模型（原 GPT-4o）。GPU 机无外网，请求经 SELF_EVOLVE_PROXY
-# 指向的反向 SOCKS 隧道（socks5h://127.0.0.1:18080）借 cpu 跳板机出网。
+# Reference VLM API：live 筛题由 GPU 机器直接请求阿里云百炼的
+# OpenAI 兼容端点 + Qwen 模型。可通过 REFERENCE_BASE_URL 覆盖端点。
 REFERENCE_BASE_URL="${REFERENCE_BASE_URL:-https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1}"
 # API key 放 .env（gitignored），或直接 export；shell 里已 export 的永远优先。
 ENV_FILE="$REPO/.env"

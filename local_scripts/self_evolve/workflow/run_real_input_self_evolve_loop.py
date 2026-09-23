@@ -1746,7 +1746,10 @@ def run_trainer_stage(
         # subprocess then reports to whatever wandb project/entity the env sets).
         if os.environ.get("SELF_EVOLVE_REPORT_TO", "none") == "none":
             run_env["WANDB_MODE"] = "disabled"
-        run_env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        # Colocated vLLM sleep mode uses CuMemAllocator. PyTorch expandable
+        # segments are incompatible with that memory pool and abort vLLM init.
+        run_env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+        run_env.pop("PYTORCH_ALLOC_CONF", None)
         run_env["PYTHONPATH"] = f"{SRC_DIR}:{run_env.get('PYTHONPATH', '')}"
         # FSDP2 (GRPO route only). transformers 4.49 exports ACCELERATE_USE_FSDP
         # from --fsdp but NOT the FSDP version or state-dict type, and accelerate
