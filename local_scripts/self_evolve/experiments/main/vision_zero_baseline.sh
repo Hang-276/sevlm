@@ -1,100 +1,91 @@
 #!/usr/bin/env bash
-# Main experiment: base + vision-zero.
-#
-# Runs upstream Vision-Zero's own self-play recipe: alternating clue/decision
-# phases with its own two rewards (clue format with votes + decision
-# accuracy) — none of our loop, no five-dim reward, no bbox.
-#
-# Aligned with ours (keeps the main table comparable): base model, image
-# pool, num_players, num_generations, GPU count, per-device batch,
-# max_completion_length, total steps. The only thing not aligned is the
-# method itself — which is exactly what this exp measures.
-#
-# The trainer is invoked directly rather than through upstream's launcher: that
-# one assigns `MODEL = ...` with spaces (not valid bash), passes the literal
-# string as `--model_name_or_path`, and sets `--dispatch_batches`, which is not
-# a TrainingArguments parameter in current transformers.
+# Experiment 3: the official Vision-Zero recipe in a separate checkout/env.
+# Does not source sevlm paths.sh, common.sh, train_defaults.sh or .env.
+# Setup and evaluation: ../VISION_ZERO.md. DRY_RUN=1 only prints the command.
 set -euo pipefail
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/common.sh"
 
-NUM_PLAYERS="${NUM_PLAYERS:-5}"          # matches ours' task generation
-NUM_ROUNDS="${NUM_ROUNDS:-2}"            # Vision-Zero's own clue round count
-NUM_GENERATIONS="${NUM_GENERATIONS:-$MAIN_NUM_GENERATIONS}"
-NUM_GPUS="${NUM_GPUS:-8}"
-PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-1}"
-GRAD_ACCUM="${GRAD_ACCUM:-8}"
-MAX_STEPS="${MAX_STEPS:-$TOTAL_GRPO_STEPS}"   # same total GRPO budget as every main exp
-EPOCH_SIZE="${EPOCH_SIZE:-450}"
-TRAINING_PHASE="${TRAINING_PHASE:-interactive}"
-INTERACTIVE_CYCLE_LENGTH="${INTERACTIVE_CYCLE_LENGTH:-1}"
-LR="${LR:-1e-6}"                         # aligned with ours' GRPO_LR
-BETA="${BETA:-0.04}"
+readonly OFFICIAL_COMMIT="386fa20711130b9c7d8a340edd285c6242d8d255"
+: "${VISION_ZERO_REPO:?Set VISION_ZERO_REPO to the official vision-zero checkout}"
+: "${VISION_ZERO_PY:?Set VISION_ZERO_PY to the absolute Python path in the separate environment}"
+: "${VISION_ZERO_MODEL:?Set VISION_ZERO_MODEL to the original Qwen2.5-VL-7B-Instruct directory}"
+: "${VISION_ZERO_DATASET:?Set VISION_ZERO_DATASET to the directory containing output/}"
+: "${VISION_ZERO_OUTPUT:?Set VISION_ZERO_OUTPUT to a new absolute run directory}"
 
-RUN_TAG="${RUN_TAG:-vision_zero}"
-OUT_DIR="$EXP_RUNS_ROOT/$RUN_TAG"
-IMAGES_DIR="$DATASET_ROOT/output/replacement_images"
-SCENES_DIR="$DATASET_ROOT/output/replacement_scenes"
+fail() { echo "[ERROR] $*" >&2; exit 2; }
+for value in "$VISION_ZERO_REPO" "$VISION_ZERO_PY" "$VISION_ZERO_MODEL" \
+             "$VISION_ZERO_DATASET" "$VISION_ZERO_OUTPUT"; do
+  case "$value" in /*) ;; *) fail "Use absolute paths: $value" ;; esac
+done
+[ -x "$VISION_ZERO_PY" ] || fail "Python is not executable: $VISION_ZERO_PY"
+[ -f "$VISION_ZERO_MODEL/config.json" ] || fail "Model config.json not found"
+IMAGES_DIR="$VISION_ZERO_DATASET/output/replacement_images"
+SCENES_DIR="$VISION_ZERO_DATASET/output/replacement_scenes"
+[ -d "$IMAGES_DIR" ] || fail "Missing image directory: $IMAGES_DIR"
+[ -d "$SCENES_DIR" ] || fail "Missing scene directory: $SCENES_DIR"
 
-require_paths
-load_env
-[ -d "$IMAGES_DIR" ] || { echo "[ERROR] CLEVR images directory does not exist: $IMAGES_DIR" >&2; exit 2; }
-[ -d "$SCENES_DIR" ] || { echo "[ERROR] CLEVR scenes directory does not exist: $SCENES_DIR" >&2; exit 2; }
-mkdir -p "$OUT_DIR"
+TRAIN_ROOT="$VISION_ZERO_REPO/src/open-r1-multimodal"
+ENTRY="$TRAIN_ROOT/src/open_r1/grpo_jsonl.py"
+ZERO_CONFIG="$TRAIN_ROOT/local_scripts/zero3_model_parallel.json"
+[ -f "$ENTRY" ] && [ -f "$ZERO_CONFIG" ] || fail "Not an official Vision-Zero checkout"
+ACTUAL_COMMIT="$(git -C "$VISION_ZERO_REPO" rev-parse HEAD)"
+[ "$ACTUAL_COMMIT" = "$OFFICIAL_COMMIT" ] || fail "Expected official commit $OFFICIAL_COMMIT, got $ACTUAL_COMMIT"
+git -C "$VISION_ZERO_REPO" diff --quiet HEAD -- src/open-r1-multimodal \
+  || fail "Official training code/config has local changes; use a clean checkout"
+[ ! -e "$VISION_ZERO_OUTPUT" ] || fail "Output already exists; choose a new VISION_ZERO_OUTPUT to avoid implicit resume"
 
-if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
-  export CUDA_VISIBLE_DEVICES="$(seq -s, 0 $((NUM_GPUS-1)))"
+RUN_NAME="${VISION_ZERO_RUN_NAME:-Qwen2.5-VL-7B-Vision-Zero-official}"
+REPORT_TO="${VISION_ZERO_REPORT_TO:-none}"
+# Values below reproduce the published launcher, not sevlm's main protocol.
+# Explicit seed, pixel limits, vLLM=False and max_steps=-1 match upstream defaults.
+CMD=(
+  "$VISION_ZERO_PY" -m torch.distributed.run
+  --nproc_per_node=8 --nnodes=1 --node_rank=0
+  --master_addr=127.0.0.1 --master_port="${VISION_ZERO_MASTER_PORT:-12350}"
+  "$ENTRY"
+  --deepspeed "$ZERO_CONFIG"
+  --output_dir "$VISION_ZERO_OUTPUT" --model_name_or_path "$VISION_ZERO_MODEL"
+  --dataset_name dynamic_clevr_spotdiff --use_dynamic_dataset
+  --epoch_size 450 --data_generator_type clevr_spotdiff
+  --clevr_images_dir "$IMAGES_DIR" --clevr_scenes_dir "$SCENES_DIR"
+  --clevr_num_players 4 --clevr_num_rounds 2
+  --training_phase interactive --interactive_cycle_length 1
+  --data_generator_seed 42 --seed 42 --max_anyres_num 6
+  --max_prompt_length 8000 --max_completion_length 512
+  --min_pixels 3136 --max_pixels 12845056
+  --num_generations 8 --per_device_train_batch_size 1
+  --gradient_accumulation_steps 8 --logging_steps 1
+  --bf16 --torch_dtype bfloat16 --beta 0.04
+  --report_to "$REPORT_TO" --gradient_checkpointing true
+  --attn_implementation flash_attention_2 --use_vllm False
+  --num_train_epochs 40 --max_steps -1
+  --learning_rate 1e-5 --warmup_ratio 0.1 --lr_scheduler_type cosine
+  --run_name "$RUN_NAME" --save_steps 5 --save_only_model true
+  --reward_funcs clevr_clue_format_with_votes clevr_decision_accuracy
+  --val_split_ratio 0.0 --num_iterations 1
+)
+
+echo "[vision-zero] official source=$OFFICIAL_COMMIT"
+echo "[vision-zero] 8 GPUs; 40 epochs; 4 players; G=8; no sevlm trainer imports"
+printf '%q ' "${CMD[@]}"; printf '\n'
+if [ "${DRY_RUN:-0}" = 1 ]; then
+  exit 0
 fi
-export PYTHONPATH="${PYTHONPATH:-}:$REPO/src"
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-if [ "${WANDB:-0}" = "1" ]; then
-  export WANDB_PROJECT="${WANDB_PROJECT:-self-evolve-vlm}"
-  export WANDB_NAME="${WANDB_NAME:-$RUN_TAG}"
-  REPORT_TO=wandb
-else
-  REPORT_TO=none
-fi
 
-banner "vision_zero baseline
-  OUT_DIR=$OUT_DIR
-  players=$NUM_PLAYERS rounds=$NUM_ROUNDS gen=$NUM_GENERATIONS steps=$MAX_STEPS gpus=$NUM_GPUS
-  phase=$TRAINING_PHASE  reward=clevr_clue_format_with_votes + clevr_decision_accuracy"
-
-cd "$REPO"
-"$PY" -m torch.distributed.run --nproc_per_node="$NUM_GPUS" \
-  --master_port="${MASTER_PORT:-12350}" \
-  src/open_r1/grpo_jsonl.py \
-  --deepspeed "$REPO/local_scripts/zero3.json" \
-  --output_dir "$OUT_DIR" \
-  --model_name_or_path "$BASE_MODEL" \
-  --dataset_name dynamic_clevr_spotdiff \
-  --use_dynamic_dataset \
-  --data_generator_type clevr_spotdiff \
-  --clevr_images_dir "$IMAGES_DIR" \
-  --clevr_scenes_dir "$SCENES_DIR" \
-  --clevr_num_players "$NUM_PLAYERS" \
-  --clevr_num_rounds "$NUM_ROUNDS" \
-  --training_phase "$TRAINING_PHASE" \
-  --interactive_cycle_length "$INTERACTIVE_CYCLE_LENGTH" \
-  --epoch_size "$EPOCH_SIZE" \
-  --data_generator_seed "${SEED:-42}" \
-  --reward_funcs clevr_clue_format_with_votes clevr_decision_accuracy \
-  --max_prompt_length "${GRPO_MAX_PROMPT_LEN:-8000}" \
-  --max_completion_length "$GRPO_MAX_COMPLETION_LEN" \
-  --min_pixels "$GRPO_MIN_PIXELS" --max_pixels "$GRPO_MAX_PIXELS" \
-  --num_generations "$NUM_GENERATIONS" \
-  --per_device_train_batch_size "$PER_DEVICE_BATCH" \
-  --gradient_accumulation_steps "$GRAD_ACCUM" \
-  --max_steps "$MAX_STEPS" \
-  --learning_rate "$LR" --beta "$BETA" \
-  --warmup_ratio "$GRPO_WARMUP_RATIO" --lr_scheduler_type "$GRPO_LR_SCHEDULER" \
-  --bf16 --torch_dtype bfloat16 \
-  --gradient_checkpointing true \
-  --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
-  --max_grad_norm 0.3 \
-  --logging_steps 1 --save_steps 10 --save_only_model true \
-  --report_to "$REPORT_TO" --run_name "$RUN_TAG" \
-  --num_iterations 1 --val_split_ratio 0.0 \
-  2>&1 | tee -a "$OUT_DIR/run.log"
-
-record_run "${MARKER:-vision_zero}" "$OUT_DIR"
-banner "Training done. Evaluate: MARKER=vision_zero bash $EXP_DIR/main/eval.sh"
+# Select only the official source, even if this shell previously ran sevlm.
+export PYTHONPATH="$TRAIN_ROOT/src"
+export PYTHONNOUSERSITE=1
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+IFS=, read -r -a GPU_IDS <<< "$CUDA_VISIBLE_DEVICES"
+[ "${#GPU_IDS[@]}" -eq 8 ] || fail "This official recipe requires exactly 8 visible GPUs"
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+unset PYTORCH_ALLOC_CONF
+export DEBUG_MODE=true
+mkdir -p "$VISION_ZERO_OUTPUT"
+export LOG_PATH="$VISION_ZERO_OUTPUT/debug_log.txt"
+printf '%s\n' "$OFFICIAL_COMMIT" > "$VISION_ZERO_OUTPUT/official_commit.txt"
+printf '%q ' "${CMD[@]}" > "$VISION_ZERO_OUTPUT/launch_command.txt"
+printf '\n' >> "$VISION_ZERO_OUTPUT/launch_command.txt"
+cd "$TRAIN_ROOT"
+"${CMD[@]}" 2>&1 | tee "$VISION_ZERO_OUTPUT/run.log"
+echo "[done] Full model: $VISION_ZERO_OUTPUT"
+echo "[eval] Evaluate this checkpoint with the same protocol as all other main-table models."

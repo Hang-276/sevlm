@@ -1,9 +1,9 @@
 # experiments
 
-Four directories, one per kind of experiment. `lib/` holds the runner that
-does the real work; every other script is a dozen-line wrapper that sets a
-few environment variables and execs it — so whatever differs between two
-exps, you can see it right in the wrapper.
+Four directories, one per kind of experiment. `lib/` holds the shared sevlm
+runners. Most wrappers set a few variables and call those runners.
+Experiment 3 is independent: `main/vision_zero_baseline.sh` launches a pinned
+official Vision-Zero checkout in its own environment. See [VISION_ZERO.md](VISION_ZERO.md).
 
 ```
 lib/         shared runner + tools (not run directly)
@@ -27,7 +27,7 @@ E=local_scripts/self_evolve/experiments
 |---|---|
 | base zero-shot | `main/base_zeroshot.sh` |
 | base + GRPO | `main/grpo_baseline.sh` |
-| base + vision-zero | `main/vision_zero_baseline.sh` |
+| base + vision-zero (official recipe) | `main/vision_zero_baseline.sh` — [separate setup](VISION_ZERO.md) |
 | base + ours | `main/ours.sh` |
 | base + ours w/o self-play | `main/ours_no_self_play.sh` |
 | base + ours w/o process reward | `main/ours_no_process.sh` |
@@ -36,9 +36,15 @@ E=local_scripts/self_evolve/experiments
 tmux new -s run
 bash $E/main/ours.sh                 && bash $E/main/eval.sh
 bash $E/main/grpo_baseline.sh        && MARKER=grpo_baseline bash $E/main/eval.sh
-bash $E/main/vision_zero_baseline.sh && MARKER=vision_zero  bash $E/main/eval.sh
 bash $E/main/ours_no_self_play.sh    && MARKER=ours_no_self_play bash $E/main/eval.sh
 ```
+
+For experiment 3, follow [VISION_ZERO.md](VISION_ZERO.md) to set the official
+checkout, Python, model, data and output paths, then run
+`bash $E/main/vision_zero_baseline.sh`. It does not use the shared training
+defaults or create a `vision_zero` marker. Evaluate its explicit output model
+path under the same evaluation protocol used for all five rows. The official
+40-epoch recipe is not automatically budget-matched to ours.
 
 `ours_no_self_play` is the row that says what the proposing side is worth:
 the model still solves everything, but a regret heuristic picks the edits
