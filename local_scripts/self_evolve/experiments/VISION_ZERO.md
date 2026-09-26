@@ -1,8 +1,9 @@
-# 实验③：官方 Vision-Zero 独立运行
+# 实验③：官方 Vision-Zero 实现，对齐主实验设置
 
 入口：`main/vision_zero_baseline.sh`。该入口仅负责启动官方训练代码，不使用
 sevlm 的 trainer、`paths.sh`、`common.sh`、`train_defaults.sh` 或 `.env`，
-不会改变 ours 主实验的实现和配置。它替代了原先调用 sevlm 本地 trainer 的入口。
+不会改变 ours 主实验的实现和配置。使用固定的官方算法实现，更新步数、batch、
+学习率及输入/输出长度等公共参数按下述主实验配置对齐，不再默认使用官方 40 epochs 配方。
 
 ## 固定官方版本
 
@@ -47,7 +48,7 @@ FlashAttention。上面的 `json-repair` 补足官方训练入口直接导入、
   解压后应含 `output/replacement_images/` 和 `output/replacement_scenes/`。
 - 8 张 GPU；本次计划使用 8×A100 80GB。官方 ZeRO 配置同时卸载参数和优化器到 CPU，
   因而还需要充足的主机内存。显存、主机内存和耗时仍需服务器试跑确认。
-- 独立输出目录；官方每 5 步保存全模型，需要预留足够磁盘空间。
+- 独立输出目录；本入口每 10 步保存全模型，需要预留足够磁盘空间。
 
 ## 预览与正式启动
 
@@ -56,7 +57,7 @@ export VISION_ZERO_REPO=/data/Vision-Zero-official
 export VISION_ZERO_PY=/path/to/conda/envs/vision-zero-official/bin/python
 export VISION_ZERO_MODEL=/data/models/Qwen2.5-VL-7B-Instruct
 export VISION_ZERO_DATASET=/data/Vision-Zero-clevr-dataset
-export VISION_ZERO_OUTPUT=/data/runs/vision_zero_official_seed42
+export VISION_ZERO_OUTPUT=/data/runs/vision_zero_aligned_seed42
 
 cd /path/to/sevlm
 # 只检查路径、官方版本并打印参数，不加载模型、不启动 GPU、不创建输出目录。
@@ -73,34 +74,68 @@ bash local_scripts/self_evolve/experiments/main/vision_zero_baseline.sh
 训练不依赖 sevlm 的 `.env` 或 Reference VLM API。
 
 本入口有意不读取主实验的 `MAX_STEPS`、`GRPO_LR`、`NUM_GENERATIONS` 等环境变量，
-防止继承另一实验的设置。训练超参数固定为下表所示官方配方。
+防止继承另一实验的设置。默认按 `ours_full_pipeline_train.sh` 的配置快照对齐。
 
-## 官方配方与启动修正
+如果主实验实际使用的是另一入口 `main/ours.sh`，启动前设置：
+
+```bash
+export VISION_ZERO_PROTOCOL=main_ours
+```
+
+如果朋友运行时覆盖了默认值，以其真实启动日志为准，用专用变量覆盖：
+`VISION_ZERO_MAX_STEPS`（所有轮累计 GRPO 更新数）、`VISION_ZERO_NUM_GENERATIONS`、
+`VISION_ZERO_PER_DEVICE_BATCH`、`VISION_ZERO_GRAD_ACCUM`。
+如果还改了学习率、图像像素或长度，需要同步调整③的独立启动参数。
+所有最终参数写入 `launch_command.txt`，所选协议和 batch 写入 `alignment_config.txt`。
+
+## 对齐范围与保留的原方法
 
 来源：[官方启动脚本](https://github.com/wangqinsi1/RLSVR/blob/386fa20711130b9c7d8a340edd285c6242d8d255/run_scripts/run_grpo_vision_zero.sh)。
-这是公开代码的配置，不保证等于论文中每组结果的完整配方。
+训练代码使用该官方版本；启动参数是本仓库的受控对比配置，不应标注为“官方原生超参数”。
+主实验配置快照来自 sevlm 提交 `346490d`，没有执行或 source 主实验脚本。
+
+| 设置 | 默认 `ours_full_pipeline` | 可选 `main_ours` |
+|---|---|---|
+| 对齐入口 | `ours_full_pipeline_train.sh` | `main/ours.sh` → 公共 runner |
+| 累计 GRPO 更新数 | 2 × 120 = **240** | 1 × 320 = **320** |
+| G | 8 | 16 |
+| 每卡 batch / 梯度累积 | 2 / 8 | 8 / 1 |
+| 名义有效 batch（8 卡） | 128 | 64 |
+
+两种 profile 共用以下设置：
 
 | 参数 | 值 |
 |---|---|
 | 模型与适配 | Qwen2.5-VL-7B-Instruct，全参数 BF16 |
-| GPU / ZeRO | 8 卡；官方 `zero3_model_parallel.json`，参数及优化器 CPU offload |
+| GPU / ZeRO | 8 卡；基于官方 ZeRO-3，参数及优化器 CPU offload |
 | 玩家 / clue rounds | 4 / 2 |
 | 阶段 | interactive；decision、clue 每 1 个更新步切换 |
 | 奖励 | clevr_clue_format_with_votes + clevr_decision_accuracy |
-| Epoch size / epochs | 450 / 40；不以 320 步替代 |
-| G / 每卡 batch / 梯度累积 | 8 / 1 / 8 |
-| LR / beta | 1e-5 / 0.04 |
+| Epoch size | 保留官方 450；只是动态数据长度，训练由 max_steps 停止 |
+| LR / beta / weight decay | 1e-6 / 0.06 / 0 |
 | Warmup / scheduler | 0.1 / cosine |
-| Prompt / completion 参数 | 8000 / 512；实际截断行为由官方训练器决定 |
-| 图像像素上下限 | 3136 / 12845056，来自官方程序默认值 |
+| Prompt / completion 参数 | 10240 / 2048；实际截断行为由官方训练器决定 |
+| 图像像素上下限 | 802816 / 1003520 |
+| Temperature / gradient clipping | 1.0 / 0.3 |
 | Attention / vLLM | flash_attention_2 / False |
 | Seed / num_iterations | 42 / 1 |
-| 保存 | 每 5 步，只保存模型 |
+| 保存 | 每 10 步，只保存模型 |
 
-与上游 shell 的差异仅在启动和记录层面：正确传递模型变量、使用绝对路径、
-省略不兼容的 `--dispatch_batches False`、将上游默认值显式写出、默认关闭 WandB，
-以及保存 `official_commit.txt`、`launch_command.txt`、`run.log`。
-官方源码及其 ZeRO 配置不作修改；没有将 ours 的奖励、SFT 或筛题流程带入③。
+保留官方的 4 玩家、2 clue rounds、交替阶段、奖励和 advantage 算法，
+不引入 ours 的 SFT、Reference VLM、proposer 或筛题机制。
+官方 ZeRO 配置固定 clipping=1.0，与对齐后的 `max_grad_norm=0.3` 冲突；
+入口会在输出目录写一份只将 `gradient_clipping` 改为 `auto` 的配置副本，
+不修改官方文件或主实验文件。梯度检查点显式使用 non-reentrant 模式。
+模型路径和上游 shell 的变量错误也已修正，省略了不兼容的 `--dispatch_batches False`。
+
+这只是对齐共同参数，不代表等 FLOPs、等轨迹数或等端到端成本：
+
+- 默认 ours 有两轮，学习率调度会按每轮重启；③是一次 240 步连续训练。
+- Vision-Zero 的一个输入游戏会展开成交互和多条生成，名义 batch 不等于实际轨迹数。
+- ours 的每轮 256 候选题与 Vision-Zero 的动态 `epoch_size=450` 含义不同；
+  不能把它们设成同一个数字就声称等训练数据。两边应使用同一 CLEVR 数据来源/划分。
+- ours 还有 SFT、筛题与离线 solver；应额外记录生成 token、轨迹数和总资源消耗。
+- 官方训练器可能忽略 prompt 截断上限；这里对齐传入值，不宣称实际最大长度被强制一致。
 
 ## 评测与论文记录
 
@@ -114,7 +149,7 @@ bash local_scripts/self_evolve/experiments/main/vision_zero_baseline.sh
 本次仅替换③的训练入口，不修改公共评测代码；公共 `load_env` 在缺少 `.env` 时
 提前退出的问题仍需另行处理。
 
-论文记录应写为“使用官方公开训练配方复现的 Vision-Zero”。它与 ours 属于方法对比，
-不是单因素消融；如果训练预算不同，应报告实际更新步数、轨迹/token 数和计算资源，
-不能声称是等预算实验。先前依据 sevlm 的 320 步/vLLM 配置给出的时间预算不适用于
-这套 40 epochs、非 vLLM、CPU offload 配方。
+论文可写为“使用官方 Vision-Zero 实现，并对齐共同训练超参数及累计 GRPO 更新数”。
+它与 ours 属于方法对比，不是单因素消融；不能仅凭 step 相同声称等计算预算。
+当前仍使用官方非 vLLM、CPU offload 路径，时间需在目标服务器重新测量。
+具体 benchmark 清单与训练/评测数据区别见 [EVAL_DATASETS.md](EVAL_DATASETS.md)。

@@ -27,7 +27,7 @@ E=local_scripts/self_evolve/experiments
 |---|---|
 | base zero-shot | `main/base_zeroshot.sh` |
 | base + GRPO | `main/grpo_baseline.sh` |
-| base + vision-zero (official recipe) | `main/vision_zero_baseline.sh` — [separate setup](VISION_ZERO.md) |
+| base + vision-zero (official implementation, aligned settings) | `main/vision_zero_baseline.sh` — [separate setup](VISION_ZERO.md) |
 | base + ours | `main/ours.sh` |
 | base + ours w/o self-play | `main/ours_no_self_play.sh` |
 | base + ours w/o process reward | `main/ours_no_process.sh` |
@@ -43,8 +43,13 @@ For experiment 3, follow [VISION_ZERO.md](VISION_ZERO.md) to set the official
 checkout, Python, model, data and output paths, then run
 `bash $E/main/vision_zero_baseline.sh`. It does not use the shared training
 defaults or create a `vision_zero` marker. Evaluate its explicit output model
-path under the same evaluation protocol used for all five rows. The official
-40-epoch recipe is not automatically budget-matched to ours.
+path under the same evaluation protocol used for all five rows. By default,
+the launcher aligns total GRPO steps and common settings with
+`ours_full_pipeline_train.sh` (240 steps, G=8, nominal batch=128).
+Set `VISION_ZERO_PROTOCOL=main_ours` for `main/ours.sh` defaults instead
+(320 steps, G=16, nominal batch=64). Neither profile equates total generated
+tokens/FLOPs across the two methods. See [EVAL_DATASETS.md](EVAL_DATASETS.md)
+for the actual 6-benchmark versus 10-benchmark evaluation entry points.
 
 `ours_no_self_play` is the row that says what the proposing side is worth:
 the model still solves everything, but a regret heuristic picks the edits
