@@ -36,14 +36,13 @@ git -C "$VISION_ZERO_REPO" diff --quiet HEAD -- src/open-r1-multimodal \
 
 RUN_NAME="${VISION_ZERO_RUN_NAME:-Qwen2.5-VL-7B-Vision-Zero-aligned}"
 REPORT_TO="${VISION_ZERO_REPORT_TO:-none}"
-# Snapshots of the two sevlm entry points at commit 346490d. Do not source
-# their launchers: doing so would activate the main environment/start training.
-# Default: ours_full_pipeline_train.sh, 2 rounds x 120 GRPO steps.
-# main_ours: main/ours.sh -> lib/run_self_evolve.sh + train_defaults.sh.
+# Both sevlm main entry points now share this RL budget. Keep in sync with
+# ours_full_pipeline_train.sh and configs/train_defaults.sh + lib/run_self_evolve.sh.
+# Do not source their launchers: that would activate the main environment/start training.
+# Retain both protocol names as aliases for existing launch commands.
 PROTOCOL="${VISION_ZERO_PROTOCOL:-ours_full_pipeline}"
 case "$PROTOCOL" in
-  ours_full_pipeline) DEFAULT_STEPS=240; DEFAULT_G=8; DEFAULT_BATCH=2; DEFAULT_ACCUM=8 ;;
-  main_ours) DEFAULT_STEPS=320; DEFAULT_G=16; DEFAULT_BATCH=8; DEFAULT_ACCUM=1 ;;
+  ours_full_pipeline|main_ours) DEFAULT_STEPS=240; DEFAULT_G=8; DEFAULT_BATCH=2; DEFAULT_ACCUM=8 ;;
   *) fail "VISION_ZERO_PROTOCOL must be ours_full_pipeline or main_ours" ;;
 esac
 # Prefix overrides explicitly; unrelated main-run environment variables cannot leak in.

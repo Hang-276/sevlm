@@ -1,5 +1,8 @@
 # experiments
 
+**负责实验①和③的新合作者：先读 [COLLABORATOR_START_HERE.md](COLLABORATOR_START_HERE.md)。**
+该文档先解释研究问题和实验分工，再给出独立训练、统一评测及结果交付步骤。
+
 Four directories, one per kind of experiment. `lib/` holds the shared sevlm
 runners. Most wrappers set a few variables and call those runners.
 Experiment 3 is independent: `main/vision_zero_baseline.sh` launches a pinned
@@ -17,7 +20,7 @@ Run everything from the repo root; the scripts locate
 themselves. Shorthand used below:
 
 ```bash
-cd <repo root>
+cd /path/to/sevlm
 E=local_scripts/self_evolve/experiments
 ```
 
@@ -46,8 +49,8 @@ defaults or create a `vision_zero` marker. Evaluate its explicit output model
 path under the same evaluation protocol used for all five rows. By default,
 the launcher aligns total GRPO steps and common settings with
 `ours_full_pipeline_train.sh` (240 steps, G=8, nominal batch=128).
-Set `VISION_ZERO_PROTOCOL=main_ours` for `main/ours.sh` defaults instead
-(320 steps, G=16, nominal batch=64). Neither profile equates total generated
+`main/ours.sh` now shares that RL budget; `VISION_ZERO_PROTOCOL=main_ours`
+is retained as an alias with the same defaults. Neither profile equates total generated
 tokens/FLOPs across the two methods. See [EVAL_DATASETS.md](EVAL_DATASETS.md)
 for the actual 6-benchmark versus 10-benchmark evaluation entry points.
 
@@ -59,10 +62,12 @@ instead of the model proposing them. Nothing else changes.
 the final round's weights), a trainer output dir (picks the
 highest-numbered checkpoint), or a directory that already is a full model.
 
-`main/eval.sh` is the single evaluation entry every exp shares — datasets,
-judge and decoding settings all live there. Don't change them inside one
-exp, or the main table stops being comparable. With no run_dir it uses the
-most recent recorded run; `MARKER=xxx` selects which one.
+`main/eval.sh` is the legacy shared entry; with no run_dir it uses the most
+recent recorded run (`MARKER=xxx` selects one). Experiments 1 and 3 now use
+the isolated `analysis/eval_checkpoint.sh` with explicit model paths and
+saved evaluation configs. Follow [the collaborator guide](COLLABORATOR_START_HERE.md)
+and use the same explicit datasets, decoding and judge for all five rows;
+do not assume the legacy defaults equal the new evaluator's explicit settings.
 
 ## ablation
 
@@ -132,7 +137,7 @@ bash $E/analysis/spurious_reward_control.sh random
 bash $E/analysis/spurious_reward_control.sh format_only
 
 # Collapse diagnostics read from an existing run — no retraining.
-bash $E/analysis/collapse_diagnostics.sh <run_dir>
+bash $E/analysis/collapse_diagnostics.sh /path/to/run_dir
 
 # Custom-decoding evaluation of one checkpoint (separate from the
 # main-table eval path).

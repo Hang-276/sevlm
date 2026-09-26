@@ -1,5 +1,8 @@
 # Self-evolving VLM visual reasoning agent
 
+**新合作者从这里开始：** [理解研究并完成实验①和③（中文）](local_scripts/self_evolve/experiments/COLLABORATOR_START_HERE.md)。
+这份说明包含五组实验的关系、数据区别、独立环境、启动步骤、当前脚本限制和交付清单。
+
 A closed training loop on the CLEVR spot-the-difference task. The model sets
 its own puzzles and then solves them: it picks which of a scene's changed
 objects stay changed, splicing turns that pick into a task whose answer is
@@ -30,7 +33,7 @@ The library the loop is built from is `src/open_r1/self_evolve/`.
 ## Getting started
 
 ```bash
-cd <repo root>
+cd /path/to/sevlm
 E=local_scripts/self_evolve
 
 # 1. Install: read setup.sh (it opens with commented-out conda create lines),
@@ -63,8 +66,10 @@ load one model on one GPU, with the image limit set from the task shard and
 a 32768-token context. The standalone sampler defaults to 8 images.
 VLMEvalKit evaluation also defaults to vLLM (`USE_VLLM=0` switches it back).
 
-Training needs no API. Only the evaluation MCQ judge wants a key, and
-`JUDGE=exact_matching` scores locally instead.
+The isolated Vision-Zero baseline needs no training API. The default ours
+launcher enables live reference screening and answer judging, which require
+configured API access. Evaluation can use an API judge, or
+`JUDGE=exact_matching` for local scoring; keep the choice consistent across models.
 
 ## What to watch on the first real run
 

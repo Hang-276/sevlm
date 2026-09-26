@@ -4,10 +4,14 @@
 
 ## 两个入口的默认 benchmark 不同
 
-`main/base_zeroshot.sh` 和 `main/eval.sh` 都调用 `lib/common.sh::run_tier1_eval`：
-默认且当前支持 6 个 benchmark。`DATASETS` 可选择其子集，不能直接加入映射之外的名称。
+`main/eval.sh` 调用 `lib/common.sh::run_tier1_eval`：默认且当前支持6项。
+`main/base_zeroshot.sh` 现已委托独立的 `analysis/eval_checkpoint.sh`，仍默认6项，
+显式设置 `DATASETS` 时可选择独立入口支持的10项。
 
 `analysis/eval_checkpoint.sh <完整模型目录>` 的默认列表及映射支持 10 个 benchmark。
+路径推导和环境变量覆盖问题已修复；独立入口不再 source 训练环境或依赖可选 `.env`。
+支持 `DRY_RUN=1` 保存评测配置但不启动模型。具体操作见
+[COLLABORATOR_START_HERE.md](COLLABORATOR_START_HERE.md)。
 
 | Benchmark 配置名 | 主表入口（6项） | 单 checkpoint 入口（10项） | 主要任务 |
 |---|---|---|---|
@@ -24,7 +28,8 @@
 
 `docs/EVALUATION.md` 提到的 13 项 Tier-2 清单不是当前这两个脚本的完整可执行配置。
 `eval/fetch_vlmeval_tsv.sh` 也只预下载前 6 项。评测数据位置由 `LMUData` 指定，
-默认是 `paths.sh` 中的 `$WORKSPACE/eval/LMUData`；是否已下载齐全需在服务器检查。
+默认按 `$WORKSPACE/eval/LMUData` 推导；独立入口没有 WORKSPACE 时使用仓库目录，
+因此新机器建议显式设置 `LMUData`。是否已下载齐全需在服务器检查。
 脚本中“本机已经准备”的注释不代表其他服务器已有数据。
 
 ## 训练时如何用数据
@@ -54,7 +59,7 @@ GPT 主观评分。不同 benchmark 的分数应使用其实际评测实现与�
 
 ## 五组模型必须统一评测
 
-两个入口的默认解码也不完全一致：公共主表入口没有显式固定 temperature、
+旧公共主表入口与独立入口的默认解码不完全一致：`main/eval.sh` 没有显式固定 temperature、
 max_new_tokens 等参数，依赖已安装的 VLMEvalKit；单 checkpoint 入口显式设为
 `max_new_tokens=2048`、`temperature=0.01`、`do_sample=true`。
 两者均默认 `min_pixels=200704`、`max_pixels=1003520`、`use_custom_prompt=false`。
@@ -65,7 +70,8 @@ max_new_tokens 等参数，依赖已安装的 VLMEvalKit；单 checkpoint 入口
 `TEMPERATURE`、`MAX_NEW_TOKENS`、像素范围及 judge。
 不要把①默认的 6 项平均分与③④⑤默认的 10 项平均分比较。
 
-本次只是核对并记录评测行为，没有修改评测脚本或运行模型。
+独立评测入口的启动和参数传递已经过无GPU回归检查，没有运行真实模型。
+`main/eval.sh` 及主实验训练代码未改动；公共 `load_env` 等历史问题不影响本文推荐的独立入口。
 
 原始 benchmark 说明可参考：
 [MMVP](https://tsb0601.github.io/mmvp_blog/)、

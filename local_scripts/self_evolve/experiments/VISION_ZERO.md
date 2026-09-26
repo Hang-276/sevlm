@@ -13,8 +13,9 @@ sevlm 的 trainer、`paths.sh`、`common.sh`、`train_defaults.sh` 或 `.env`，
 在 GPU 服务器上准备独立目录（以下路径均为示例，需替换）：
 
 ```bash
-git clone --branch vision-zero --single-branch https://github.com/wangqinsi1/RLSVR.git /data/Vision-Zero-official
-git -C /data/Vision-Zero-official checkout --detach 386fa20711130b9c7d8a340edd285c6242d8d255
+mkdir -p /data/code
+git clone --branch vision-zero --single-branch https://github.com/wangqinsi1/RLSVR.git /data/code/Vision-Zero-official
+git -C /data/code/Vision-Zero-official checkout --detach 386fa20711130b9c7d8a340edd285c6242d8d255
 ```
 
 启动器要求这个提交及未修改的官方训练源码。不要在官方目录复制 sevlm 的
@@ -28,7 +29,7 @@ trainer、reward 或配置文件。
 ```bash
 conda create -n vision-zero-official python=3.11 -y
 conda activate vision-zero-official
-cd /data/Vision-Zero-official
+cd /data/code/Vision-Zero-official
 bash setup.sh
 python -m pip install json-repair
 python -m pip check
@@ -53,10 +54,11 @@ FlashAttention。上面的 `json-repair` 补足官方训练入口直接导入、
 ## 预览与正式启动
 
 ```bash
-export VISION_ZERO_REPO=/data/Vision-Zero-official
-export VISION_ZERO_PY=/path/to/conda/envs/vision-zero-official/bin/python
+conda activate vision-zero-official
+export VISION_ZERO_REPO=/data/code/Vision-Zero-official
+export VISION_ZERO_PY="$(command -v python)"
 export VISION_ZERO_MODEL=/data/models/Qwen2.5-VL-7B-Instruct
-export VISION_ZERO_DATASET=/data/Vision-Zero-clevr-dataset
+export VISION_ZERO_DATASET=/data/datasets/Vision-Zero-clevr-dataset
 export VISION_ZERO_OUTPUT=/data/runs/vision_zero_aligned_seed42
 
 cd /path/to/sevlm
@@ -74,9 +76,9 @@ bash local_scripts/self_evolve/experiments/main/vision_zero_baseline.sh
 训练不依赖 sevlm 的 `.env` 或 Reference VLM API。
 
 本入口有意不读取主实验的 `MAX_STEPS`、`GRPO_LR`、`NUM_GENERATIONS` 等环境变量，
-防止继承另一实验的设置。默认按 `ours_full_pipeline_train.sh` 的配置快照对齐。
+防止继承另一实验的设置。默认对齐两个 ours 入口现已统一的 RL 预算。
 
-如果主实验实际使用的是另一入口 `main/ours.sh`，启动前设置：
+原有 `main_ours` 名称保留为同一预算的别名，以下设置现在不会改变训练预算：
 
 ```bash
 export VISION_ZERO_PROTOCOL=main_ours
@@ -92,15 +94,17 @@ export VISION_ZERO_PROTOCOL=main_ours
 
 来源：[官方启动脚本](https://github.com/wangqinsi1/RLSVR/blob/386fa20711130b9c7d8a340edd285c6242d8d255/run_scripts/run_grpo_vision_zero.sh)。
 训练代码使用该官方版本；启动参数是本仓库的受控对比配置，不应标注为“官方原生超参数”。
-主实验配置快照来自 sevlm 提交 `346490d`，没有执行或 source 主实验脚本。
+以 `ours_full_pipeline_train.sh` 为基准统一 RL 默认值，没有执行或 source 主实验脚本。
+这不改变旧运行：旧提交的 `main/ours.sh` 曾默认320步、G=16、每卡batch=8、累积1；
+如需对照已有旧模型，必须根据其日志显式设置 `VISION_ZERO_*` 覆盖值。
 
 | 设置 | 默认 `ours_full_pipeline` | 可选 `main_ours` |
 |---|---|---|
 | 对齐入口 | `ours_full_pipeline_train.sh` | `main/ours.sh` → 公共 runner |
-| 累计 GRPO 更新数 | 2 × 120 = **240** | 1 × 320 = **320** |
-| G | 8 | 16 |
-| 每卡 batch / 梯度累积 | 2 / 8 | 8 / 1 |
-| 名义有效 batch（8 卡） | 128 | 64 |
+| 累计 GRPO 更新数 | 2 × 120 = **240** | 2 × 120 = **240** |
+| G | 8 | 8 |
+| 每卡 batch / 梯度累积 | 2 / 8 | 2 / 8 |
+| 名义有效 batch（8 卡） | 128 | 128 |
 
 两种 profile 共用以下设置：
 
@@ -144,10 +148,11 @@ export VISION_ZERO_PROTOCOL=main_ours
 切回已固定版本的评测环境，与①②④⑤共用同一份 benchmark、prompt、
 分辨率、解码及评分配置。不要在官方训练环境中安装 sevlm 来运行评测。
 
-仓库 `analysis/eval_checkpoint.sh <模型目录>` 可作为显式路径入口，但它与
-`main/eval.sh` 的默认 benchmark/解码设置不完全相同，不能在五组之间混用默认值。
-本次仅替换③的训练入口，不修改公共评测代码；公共 `load_env` 在缺少 `.env` 时
-提前退出的问题仍需另行处理。
+使用独立 `analysis/eval_checkpoint.sh "$VISION_ZERO_OUTPUT"`，设置 `LABEL=vision_zero`。
+该入口的路径、变量覆盖和 `.env` 处理已修复，经过无GPU启动回归检查；①也使用同一评测器。
+默认 benchmark 数量仍不同，必须显式统一 `DATASETS`、解码和 judge。
+完整命令见 [合作者上手说明](COLLABORATOR_START_HERE.md)。
+主实验训练和旧公共评测入口未改动；独立入口不使用公共 `load_env`。
 
 论文可写为“使用官方 Vision-Zero 实现，并对齐共同训练超参数及累计 GRPO 更新数”。
 它与 ours 属于方法对比，不是单因素消融；不能仅凭 step 相同声称等计算预算。

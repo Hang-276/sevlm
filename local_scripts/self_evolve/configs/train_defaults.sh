@@ -66,10 +66,12 @@
 # Every exp in the main results table must share these. If two exps differ
 # here, the table is comparing training budget or adaptation method, not the
 # method itself. Ablations may of course override them.
-: "${LOOP_ITERATIONS:=1}"                                        # self-evolve rounds
-: "${GRPO_STEPS_PER_ITER:=320}"                                  # GRPO steps per round
+# RL budget matches experiments/ours_full_pipeline_train.sh.
+# Keep these defaults and main/vision_zero_baseline.sh in sync.
+: "${LOOP_ITERATIONS:=2}"                                        # self-evolve rounds
+: "${GRPO_STEPS_PER_ITER:=120}"                                  # GRPO steps per round
 : "${TOTAL_GRPO_STEPS:=$((LOOP_ITERATIONS * GRPO_STEPS_PER_ITER))}"  # what a single-round exp must match
-: "${MAIN_NUM_GENERATIONS:=16}"                                  # GRPO group size
+: "${MAIN_NUM_GENERATIONS:=8}"                                   # GRPO group size
 : "${MAIN_NUM_TRAIN_TASKS:=256}"                                 # candidate tasks per round
 : "${MAIN_USE_LORA:=0}"                                          # 0 = full-parameter everywhere
 

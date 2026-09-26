@@ -12,10 +12,10 @@
 #   JUDGE=exact_matching bash .../base_zeroshot.sh       # local scoring (no API)
 # =============================================================================
 set -euo pipefail
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/common.sh"
-
-case "$WORKSPACE" in */PATH/TO/*) echo "[ERROR] WORKSPACE in paths.sh is still the placeholder; fill in the real path first" >&2; exit 2;; esac
-[ -e "$BASE_MODEL" ] || { echo "[ERROR] BASE_MODEL does not exist: $BASE_MODEL (download Qwen2.5-VL-7B-Instruct first, see paths.sh)" >&2; exit 2; }
-
-banner "eval_base  zero-shot  |  model=$BASE_MODEL"
-run_tier1_eval "base=$BASE_MODEL"
+# Use the isolated evaluator; never load training defaults or activate sevlm.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export DATASETS="${DATASETS:-MMVP MMStar BLINK RealWorldQA AI2D_TEST ChartQA_TEST}"
+export LABEL="${LABEL:-base}"
+# Experiment 1 always evaluates BASE_MODEL, not a CKPT left in the shell.
+unset CKPT
+exec bash "$HERE/../analysis/eval_checkpoint.sh"

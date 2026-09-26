@@ -29,43 +29,23 @@
 # =============================================================================
 set -euo pipefail
 
-# Evaluation uses whatever conda environment you have currently activated
-# (activate the one with VLMEvalKit deps, e.g. vllmeval). Grab the current
-# python first, before paths.sh's conda activate replaces it.
-PY_CURRENT="$(command -v python || true)"
-
-# paths.sh: for REPO / BASE_MODEL / ENV_FILE etc. Note it conda-activates the
-# training environment (vision-zero) and points PY there — evaluation doesn't
-# need that, so PY is set back to the current environment below.
-# Only paths.sh is sourced, not experiments/lib/common.sh (that one carries merge
-# logic this script doesn't use).
-SE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # local_scripts/self_evolve
-source "$SE_DIR/paths.sh"
-
-# Override the PY that paths.sh set with the current environment's python
-# (evaluation runs in your own environment; training is unaffected).
-[ -n "$PY_CURRENT" ] && PY="$PY_CURRENT"
+# Standalone evaluation: do not source paths.sh or activate the training env.
+# EVAL_PY (or PY) overrides the currently activated evaluation interpreter.
+SE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REPO="${REPO:-$(cd "$SE_DIR/../.." && pwd)}"
+WORKSPACE="${WORKSPACE:-$REPO}"
+PY="${EVAL_PY:-${PY:-$(command -v python || command -v python3 || true)}}"
+[ -n "$PY" ] || { echo "[ERROR] Activate the evaluation environment or set EVAL_PY" >&2; exit 2; }
+PY="$(command -v "$PY")"
+BASE_MODEL="${BASE_MODEL:-$WORKSPACE/models/Qwen2.5-VL-7B-Instruct}"
+VLMK="${VLMK:-$WORKSPACE/eval/VLMEvalKit}"
+LMUDATA="${LMUDATA:-$WORKSPACE/eval/LMUData}"
+EVAL_WORK_DIR="${EVAL_WORK_DIR:-$WORKSPACE/eval/results}"
+ENV_FILE="${ENV_FILE:-$REPO/.env}"
 echo "[env] using python: $PY"
 
-# =============================================================================
-#  vvv Things you change: checkpoint / sampling / datasets — mostly just here vvv
-# =============================================================================
-# --- Which model to evaluate ---
-# Put the full model directory here (edit this one line). Empty "" means
-# evaluate the base model.
-# Example: CKPT="$RUNS_ROOT/ours_final/iter_000/checkpoints/grpo/checkpoint-160"
-CKPT=""
-
-# Fallbacks: first CLI arg / env CKPT still override the value above; if
-# nothing is set, evaluate base.
+# Priority: explicit CLI model > CKPT environment > base model.
 CKPT="${1:-${CKPT:-$BASE_MODEL}}"
-[ -n "$CKPT" ] || CKPT="$BASE_MODEL"
-
-# --- Result label (the results directory name, edit this one line) ---
-# Hardcode a name if you want, e.g. LABEL="grpo_ckpt160". Empty "" derives it
-# from the checkpoint directory name.
-LABEL=""
-# Fallback: env LABEL still overrides the value above.
 LABEL="${LABEL:-}"
 
 # --- Datasets (run serially, one by one). Options: the _DATA map below. ---
@@ -113,7 +93,7 @@ WORK_DIR="${WORK_DIR:-$EVAL_WORK_DIR}"
 # ---- Up-front checks ----
 [ -d "$CKPT" ] || { echo "[ERROR] CKPT directory does not exist: $CKPT" >&2; exit 2; }
 [ -f "$CKPT/config.json" ] || { echo "[ERROR] $CKPT has no config.json (not a full model directory; this script does no LoRA merge — point it at a full model)" >&2; exit 2; }
-[ -d "$VLMK" ] || { echo "[ERROR] VLMEvalKit not found: $VLMK" >&2; exit 2; }
+[ -f "$VLMK/run.py" ] || { echo "[ERROR] VLMEvalKit not found: $VLMK" >&2; exit 2; }
 
 # Default label = checkpoint directory name (base model special-cased to "base")
 if [ -z "$LABEL" ]; then
@@ -122,6 +102,7 @@ fi
 
 # Results directory (VLMEvalKit writes <LABEL>_<DATASET>_*.csv there;
 # *_acc.csv holds the scores)
+[[ "$LABEL" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo "[ERROR] LABEL must contain letters, numbers, dots, underscores or hyphens" >&2; exit 2; }
 RESULT_DIR="$WORK_DIR/$LABEL"
 
 # MODE validity (run.py only accepts all/infer/eval)
@@ -130,10 +111,19 @@ case "$MODE" in
   *) echo "[ERROR] invalid MODE='$MODE', options: all / infer / eval" >&2; exit 2;;
 esac
 
-# Load .env (judge API key); anything already exported wins
-[ -f "$ENV_FILE" ] && { set -a; . "$ENV_FILE"; set +a; }
+# Optional .env; preserve judge values explicitly supplied in the shell.
+KEY_SET="${OPENAI_API_KEY+x}"; KEY_VALUE="${OPENAI_API_KEY:-}"
+URL_SET="${OPENAI_BASE_URL+x}"; URL_VALUE="${OPENAI_BASE_URL:-}"
+if [ -f "$ENV_FILE" ]; then
+  set -a
+  source "$ENV_FILE"
+  set +a
+fi
+if [ "$KEY_SET" = x ]; then export OPENAI_API_KEY="$KEY_VALUE"; fi
+if [ "$URL_SET" = x ]; then export OPENAI_BASE_URL="$URL_VALUE"; fi
+unset KEY_VALUE URL_VALUE
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-mkdir -p "$WORK_DIR" "$LMUData"
+mkdir -p "$RESULT_DIR" "$LMUData"
 
 echo "======================================================"
 echo "  checkpoint eval  |  label=$LABEL"
@@ -145,35 +135,26 @@ echo "  mode=$MODE   use_vllm=$USE_VLLM"
 echo "  work-dir=$WORK_DIR   LMUData=$LMUData"
 echo "======================================================"
 
-# ---- Build a self-contained temp config (label -> model_path + sampling;
-#      leaves the repo's configs untouched) ----
-TMP_CFG="$(mktemp /tmp/vlmeval_cfg_XXXX.json)"
-# shellcheck disable=SC2064
-trap "rm -f '$TMP_CFG'" EXIT
-"$PY" - "$TMP_CFG" <<PY
-import json, os, sys
-dst = sys.argv[1]
-# do_sample as a python bool
-_ds = "${DO_SAMPLE}".strip().lower() in ("1", "true", "yes", "on")
-out = {"model": {}, "data": {}}
-out["model"]["${LABEL}"] = {
-    "class": "Qwen2VLChat",
-    "model_path": "${CKPT}",
-    "min_pixels": ${MIN_PIXELS},
-    "max_pixels": ${MAX_PIXELS},
-    "max_new_tokens": ${MAX_NEW_TOKENS},
-    "temperature": ${TEMPERATURE},
-    "top_p": ${TOP_P},
-    "top_k": ${TOP_K},
-    "do_sample": _ds,
-    "repetition_penalty": ${REPETITION_PENALTY},
-    # Aligned with main/eval.sh: disable VLMEvalKit's custom prompt template
-    # so the numbers stay comparable.
-    "use_custom_prompt": False,
-}
-# Tier-1 dataset -> VLMEvalKit dataset class (MCQ via ImageMCQDataset, ChartQA
-# via VQA). The class must be the real registered VLMEvalKit name: CV-Bench
-# uses CVBench, MMMU-Pro uses MMMUProDataset.
+# Save the exact protocol; stdlib-only, safe to preview on a CPU machine.
+# Pass values as arguments, never interpolate paths/labels into Python source.
+TMP_CFG="$RESULT_DIR/eval_config.json"
+"$PY" - "$TMP_CFG" "$LABEL" "$CKPT" "$MIN_PIXELS" "$MAX_PIXELS" \
+  "$MAX_NEW_TOKENS" "$TEMPERATURE" "$TOP_P" "$TOP_K" "$DO_SAMPLE" \
+  "$REPETITION_PENALTY" "$DATASETS" "$JUDGE" "$USE_VLLM" "$VLMK" <<'PY'
+import json, subprocess, sys
+from pathlib import Path
+(dst, label, ckpt, minpx, maxpx, length, temp, top_p, top_k,
+ sample, repetition, datasets, judge, use_vllm, vlmk) = sys.argv[1:]
+if sample.lower() not in ("true", "false", "1", "0"):
+    sys.exit("[ERROR] DO_SAMPLE must be true/false or 1/0")
+out = {"model": {label: {
+    "class": "Qwen2VLChat", "model_path": ckpt,
+    "min_pixels": int(minpx), "max_pixels": int(maxpx),
+    "max_new_tokens": int(length), "temperature": float(temp),
+    "top_p": float(top_p), "top_k": int(top_k),
+    "do_sample": sample.lower() in ("true", "1"),
+    "repetition_penalty": float(repetition), "use_custom_prompt": False,
+}}, "data": {}}
 _DATA = {
     "MMVP":         {"class": "ImageMCQDataset", "dataset": "MMVP"},
     "MMStar":       {"class": "ImageMCQDataset", "dataset": "MMStar"},
@@ -187,19 +168,34 @@ _DATA = {
     "CV-Bench-2D":  {"class": "CVBench",         "dataset": "CV-Bench-2D"},
     "CV-Bench-3D":  {"class": "CVBench",         "dataset": "CV-Bench-3D"},
 }
-for d in "${DATASETS}".split():
+for d in datasets.split():
     if d not in _DATA:
         sys.exit(f"[ERROR] unknown dataset '{d}', options: {list(_DATA)}")
     out["data"][d] = _DATA[d]
-json.dump(out, open(dst, "w"), indent=2)
-print(f"[cfg] model={list(out['model'])} datasets={list(out['data'])}", file=sys.stderr)
+if not out["data"]:
+    sys.exit("[ERROR] DATASETS is empty")
+# Refuse different settings in a cache directory; users must choose a new WORK_DIR.
+try:
+    revision = subprocess.check_output(
+        ["git", "-C", vlmk, "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
+    ).strip()
+except (OSError, subprocess.CalledProcessError):
+    revision = None
+protocol = {"config": out, "judge": judge, "use_vllm": use_vllm,
+            "vlmeval_path": vlmk, "vlmeval_commit": revision}
+meta = Path(dst).with_name("eval_protocol.json")
+if meta.exists() and json.loads(meta.read_text()) != protocol:
+    sys.exit("[ERROR] Evaluation protocol changed. Use a new WORK_DIR to avoid cached predictions.")
+Path(dst).write_text(json.dumps(out, indent=2))
+meta.write_text(json.dumps(protocol, indent=2))
+print(f"[cfg] saved {dst}; datasets={list(out['data'])}", file=sys.stderr)
 PY
 
 # ---- Judge args: live judge needs OPENAI_*; exact_matching is fully local ----
 # mode=infer does no scoring, so judge args and OPENAI_* checks are skipped.
 JUDGE_ARGS=()
-if [ "$MODE" = "infer" ]; then
-  echo "[judge] mode=infer, scoring skipped (no judge / OPENAI_* needed)"
+if [ "$MODE" = "infer" ] || [ "${DRY_RUN:-0}" = 1 ]; then
+  echo "[judge] inference/preview: no judge request or API-key requirement"
 else
   JUDGE_ARGS+=(--judge "$JUDGE")
   if [ "$JUDGE" != "exact_matching" ]; then
@@ -217,11 +213,19 @@ fi
 # full output (that floods the terminal).
 RUN_ARGS=(--config "$TMP_CFG" --work-dir "$WORK_DIR" --mode "$MODE")
 [ "$USE_VLLM" = "1" ] && RUN_ARGS+=(--use-vllm)
-RUN_ARGS+=("${JUDGE_ARGS[@]}")
+if [ "$MODE" != infer ] && [ "${DRY_RUN:-0}" != 1 ]; then
+  RUN_ARGS+=("${JUDGE_ARGS[@]}")
+fi
+
+# Preview does not import VLMEvalKit/torch, load a model, or start inference.
+if [ "${DRY_RUN:-0}" = 1 ]; then
+  echo "[preview] saved config=$TMP_CFG; no model loaded; live judge credentials not checked"
+  exit 0
+fi
 
 # ---- Run (VLMEvalKit run.py evaluates the datasets serially, in config order) ----
-( cd "$VLMK" && "$PY" run.py "${RUN_ARGS[@]}" )
+( cd "$VLMK" && "$PY" run.py "${RUN_ARGS[@]}" ) 2>&1 | tee -a "$RESULT_DIR/eval.log"
 
 echo "======================================================"
-echo "  [done] results in $RESULT_DIR/ (*_acc.csv holds the scores)"
+echo "  [done] results in $RESULT_DIR/ (keep predictions and all dataset-specific score files)"
 echo "======================================================"

@@ -31,8 +31,9 @@ MAX_STEPS="${MAX_STEPS:-60}"          # fallback/default step count (used by any
 GRPO_MAX_STEPS="${GRPO_MAX_STEPS:-$GRPO_STEPS_PER_ITER}"     # GRPO step count (overrides MAX_STEPS)
 SFT_MAX_STEPS="${SFT_MAX_STEPS:-2}"      # SFT step count (overrides MAX_STEPS)
 NUM_GPUS="${NUM_GPUS:-8}"
-PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-8}"
-GRAD_ACCUM="${GRAD_ACCUM:-1}"
+# Match the full-pipeline launcher's nominal global batch: 8 * 2 * 8 = 128.
+PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-2}"
+GRAD_ACCUM="${GRAD_ACCUM:-8}"
 # Full-parameter training. 7B full-parameter GRPO (policy + reference model +
 # rollout + Adam state) must be sharded across 8 cards or it OOMs.
 #
