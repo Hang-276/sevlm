@@ -149,6 +149,9 @@ class OnlineVLLMSolverSampler:
             model_path = adapter.get("base_model_name_or_path") or _DEFAULT_BASE_MODEL
 
         self._processor = AutoProcessor.from_pretrained(model_path, **self._processor_kwargs())
+        _ip = getattr(self._processor, "image_processor", None)
+        print(f"[online_solver] RES_CHECK requested={self._processor_kwargs()} "
+              f"effective=min_pixels:{getattr(_ip, 'min_pixels', None)} max_pixels:{getattr(_ip, 'max_pixels', None)}")
         self._model = LLM(
             model=model_path,
             dtype=self._config.torch_dtype,

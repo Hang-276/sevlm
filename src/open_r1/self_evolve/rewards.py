@@ -258,11 +258,12 @@ def _resolve_answer_judge_endpoint(
     provider = (provider or os.environ.get("SELF_EVOLVE_REFERENCE_PROVIDER")
                 or os.environ.get("REFERENCE_PROVIDER"))
     # Auto-detect provider from whichever API key is actually present when none
-    # was explicitly configured: prefer OpenAI when only OPENAI_API_KEY is set
-    # (the common .env case), else OpenRouter. This keeps the answer judge on the
-    # SAME backend as the Reference VLM without a new config surface.
+    # was explicitly configured: prefer OpenAI when only an OpenAI-style key is
+    # set, else OpenRouter.
     if not provider:
-        if os.environ.get("OPENAI_API_KEY") and not os.environ.get("OPENROUTER_API_KEY"):
+        has_openai = (os.environ.get("ANSWER_JUDGE_API_KEY")
+                      or os.environ.get("OPENAI_API_KEY"))
+        if has_openai and not os.environ.get("OPENROUTER_API_KEY"):
             provider = "openai"
         elif os.environ.get("OPENROUTER_API_KEY"):
             provider = "openrouter"
@@ -275,13 +276,24 @@ def _resolve_answer_judge_endpoint(
         key_env = "OPENROUTER_API_KEY"
     else:
         provider = "openai"
-        default_base = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        # The answer judge has its own endpoint, so it does not have to share a
+        # base URL with the Reference VLM. ANSWER_JUDGE_* wins; the shared
+        # OPENAI_BASE_URL is the fallback for callers that only configure that.
+        default_base = (os.environ.get("ANSWER_JUDGE_BASE_URL")
+                        or os.environ.get("OPENAI_BASE_URL")
+                        or "https://api.openai.com/v1")
         default_model = "gpt-4o"
         key_env = "OPENAI_API_KEY"
-    model = (model or os.environ.get("REFERENCE_VLM_MODEL")
+    # ANSWER_JUDGE_MODEL is the judge's own knob. REFERENCE_VLM_MODEL is
+    # deliberately NOT in this chain: it names the Reference VLM's model, which
+    # is a different service, and reusing it here is how the two got entangled.
+    model = (model or os.environ.get("ANSWER_JUDGE_MODEL")
              or os.environ.get("OPENAI_MODEL") or default_model)
     base_url = base_url or default_base
-    api_key = api_key or os.environ.get(key_env)
+    # Dedicated key first so the judge can use a different credential from the
+    # Reference VLM; fall back to the shared provider key.
+    api_key = (api_key or os.environ.get("ANSWER_JUDGE_API_KEY")
+               or os.environ.get(key_env))
     return provider, model, base_url, api_key
 
 

@@ -245,14 +245,19 @@ def _resolve_reference_api_key(dry_run: bool, provider: str) -> Tuple[Optional[s
     """Resolve the API key + mode label for a reference judging run."""
     if dry_run:
         return None, "dry_run"
+    # REFERENCE_VLM_API_KEY is the dedicated credential so the Reference VLM can
+    # use a different key from the answer judge; the shared provider key stays
+    # as the fallback for callers that only configure that.
     if provider == "openrouter":
-        api_key = os.environ.get("OPENROUTER_API_KEY")
+        api_key = (os.environ.get("REFERENCE_VLM_API_KEY")
+                   or os.environ.get("OPENROUTER_API_KEY"))
         mode = "live_openrouter"
-        key_name = "OPENROUTER_API_KEY"
+        key_name = "REFERENCE_VLM_API_KEY or OPENROUTER_API_KEY"
     else:
-        api_key = os.environ.get("OPENAI_API_KEY")
+        api_key = (os.environ.get("REFERENCE_VLM_API_KEY")
+                   or os.environ.get("OPENAI_API_KEY"))
         mode = "live_openai"
-        key_name = "OPENAI_API_KEY"
+        key_name = "REFERENCE_VLM_API_KEY or OPENAI_API_KEY"
     if not api_key:
         raise SystemExit(
             f"Reference VLM live mode requires an API key for provider={provider}. "

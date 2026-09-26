@@ -49,6 +49,15 @@ def _answer_judge_force() -> bool:
     return os.environ.get("SELF_EVOLVE_ANSWER_JUDGE_FORCE", "").strip() in ("1", "true", "True")
 
 
+def _answer_judge_concurrency() -> int:
+    import os
+    try:
+        raw = os.environ.get("SELF_EVOLVE_ANSWER_JUDGE_CONCURRENCY", "16").strip() or "16"
+        return max(1, int(raw))
+    except ValueError:
+        return 16
+
+
 def _answer_judge_sample_n() -> int:
     """Experiment probe: invoke the judge on the first N trajectories per group.
 
@@ -161,6 +170,99 @@ def _resolve_grounding_scores(
     ]
 
 
+def _score_task(
+    task_examples: List[Dict[str, Any]],
+    reward_config: RewardConfig,
+    dataset_root: Optional[str],
+    default_max_reasoning_words: int,
+) -> List[Dict[str, Any]]:
+    completions = [example.get("completion", "") for example in task_examples]
+    solution = task_examples[0].get("solution", "")
+    reference_reasoning = task_examples[0].get("reference_reasoning")
+    max_reasoning_words = _reasoning_budget(task_examples, default_max_reasoning_words)
+
+    # Resolve grounding per trajectory: use a precomputed grounding_score
+    # when present, else compute from the CLEVR scene metadata (shared with
+    # the live reward). None stays None only when no context is available.
+    grounding_scores = _resolve_grounding_scores(task_examples, dataset_root)
+
+    # Build task-level metadata for per-task budget and grounding
+    first_example = task_examples[0]
+    task_metadata = _build_task_metadata(first_example, max_reasoning_words)
+
+    # Collect per-trajectory boxes if present
+    pred_boxes_per_traj = [
+        _extract_predicted_boxes(ex) for ex in task_examples
+    ]
+    gold_boxes = _extract_gold_boxes(first_example)
+
+    reward_vectors = compute_group_reward_vectors(
+        completions=completions,
+        solution=solution,
+        reference_reasoning=reference_reasoning,
+        grounding_scores=grounding_scores,
+        max_reasoning_words=max_reasoning_words,
+        task_metadata=task_metadata,
+        gold_evidence_boxes=gold_boxes,
+        predicted_evidence_boxes_per_traj=pred_boxes_per_traj,
+        include_details=True,
+        enable_answer_judge=_answer_judge_enabled(),
+        answer_judge_dry_run=_answer_judge_dry_run(),
+        answer_judge_force=_answer_judge_force(),
+        answer_judge_sample_n=_answer_judge_sample_n(),
+        problem=task_examples[0].get("problem") or task_examples[0].get("prompt"),
+    )
+
+    task_scored: List[Dict[str, Any]] = []
+    for example, reward_vector in zip(task_examples, reward_vectors):
+        failure_tags = assign_failure_tags(reward_vector)
+        details = reward_vector.get("reward_details", {})
+        buffer_name, routing_reason = route_with_config(
+            reward_vector,
+            failure_tags,
+            reward_config,
+            reward_details=details,
+        )
+
+        # Same gate inputs as the live reward, so the offline scalar
+        # matches what training optimized.
+        _pred = parse_structured_answer(example.get("completion") or "")
+        _gold = parse_structured_answer(solution or "")
+        _spy_ok = (None if _gold.get("spy") is None
+                   else _pred.get("spy") == _gold.get("spy"))
+        audit = reward_config.audit_fields(
+            reward_vector,
+            spy_correct=_spy_ok,
+            answer_correct=float(reward_vector.get("answer", 0.0)) >= 1.0,
+        )
+        reward_scalar = audit["reward_scalar_used"]
+        if isinstance(details, dict):
+            details.update(audit)
+            details["routing_decision"] = buffer_name
+            details["routing_reason"] = routing_reason
+
+        scored_example = dict(example)
+        scored_example["reward_vector"] = reward_vector
+        scored_example["failure_tags"] = failure_tags
+        scored_example["buffer"] = buffer_name
+        scored_example["routing_reason"] = routing_reason
+        scored_example["reward_scalar"] = reward_scalar
+        scored_example["reward_config_path"] = reward_config.path
+        task_scored.append(scored_example)
+
+    # SFT keeps at most one high-quality completion per task. This avoids
+    # replay being dominated by near-duplicate generations from an easy
+    # prompt while leaving every trajectory available for audit.
+    positives = [ex for ex in task_scored if ex.get("buffer") == "positive"]
+    if len(positives) > 1:
+        positives.sort(key=lambda ex: float(ex.get("reward_scalar", 0.0)), reverse=True)
+        for ex in positives[1:]:
+            ex["buffer"] = "unused"
+            ex["selection_reason"] = "positive_not_top1_for_task"
+
+    return task_scored
+
+
 def score_and_route_trajectories(
     trajectories: List[Dict[str, Any]],
     default_max_reasoning_words: int = 120,
@@ -195,8 +297,7 @@ def score_and_route_trajectories(
     # AS SOON AS that task is judged (per-task GPT-4o answer-judge is the
     # expensive step). A crash mid-stage keeps every already-judged task on
     # disk; a rerun skips those task_ids and only re-judges the remainder — no
-    # duplicate API spend. The loop is serial and iterates task_ids in sorted
-    # order, so appended rows stay in stable task_id order (no reordering).
+    # duplicate API spend.
     stream_fp = None
     done_task_ids: set[str] = set()
     if stream_path is not None:
@@ -210,103 +311,46 @@ def score_and_route_trajectories(
                 scored.append(_row)
         stream_fp = stream_path.open("a", encoding="utf-8")
 
+    pending = [
+        (str(_task_id), task_examples)
+        for _task_id, task_examples in sorted(group_by_task(trajectories).items())
+        if not (stream_fp is not None and str(_task_id) in done_task_ids)
+    ]
+
     try:
-        for _task_id, task_examples in sorted(group_by_task(trajectories).items()):
-            if stream_fp is not None and str(_task_id) in done_task_ids:
-                continue  # already judged in a prior (crashed) run — skip API call
-            completions = [example.get("completion", "") for example in task_examples]
-            solution = task_examples[0].get("solution", "")
-            reference_reasoning = task_examples[0].get("reference_reasoning")
-            max_reasoning_words = _reasoning_budget(task_examples, default_max_reasoning_words)
+        if pending:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
 
-            # Resolve grounding per trajectory: use a precomputed grounding_score
-            # when present, else compute from the CLEVR scene metadata (shared with
-            # the live reward). None stays None only when no context is available.
-            grounding_scores = _resolve_grounding_scores(task_examples, dataset_root)
+            from tqdm.auto import tqdm
 
-            # Build task-level metadata for per-task budget and grounding
-            first_example = task_examples[0]
-            task_metadata = _build_task_metadata(first_example, max_reasoning_words)
-
-            # Collect per-trajectory boxes if present
-            pred_boxes_per_traj = [
-                _extract_predicted_boxes(ex) for ex in task_examples
-            ]
-            gold_boxes = _extract_gold_boxes(first_example)
-
-            reward_vectors = compute_group_reward_vectors(
-                completions=completions,
-                solution=solution,
-                reference_reasoning=reference_reasoning,
-                grounding_scores=grounding_scores,
-                max_reasoning_words=max_reasoning_words,
-                task_metadata=task_metadata,
-                gold_evidence_boxes=gold_boxes,
-                predicted_evidence_boxes_per_traj=pred_boxes_per_traj,
-                include_details=True,
-                enable_answer_judge=_answer_judge_enabled(),
-                answer_judge_dry_run=_answer_judge_dry_run(),
-                answer_judge_force=_answer_judge_force(),
-                answer_judge_sample_n=_answer_judge_sample_n(),
-                problem=task_examples[0].get("problem") or task_examples[0].get("prompt"),
-            )
-
-            task_scored: List[Dict[str, Any]] = []
-            for example, reward_vector in zip(task_examples, reward_vectors):
-                failure_tags = assign_failure_tags(reward_vector)
-                details = reward_vector.get("reward_details", {})
-                buffer_name, routing_reason = route_with_config(
-                    reward_vector,
-                    failure_tags,
-                    reward_config,
-                    reward_details=details,
-                )
-
-                # Same gate inputs as the live reward, so the offline scalar
-                # matches what training optimized.
-                _pred = parse_structured_answer(example.get("completion") or "")
-                _gold = parse_structured_answer(solution or "")
-                _spy_ok = (None if _gold.get("spy") is None
-                           else _pred.get("spy") == _gold.get("spy"))
-                audit = reward_config.audit_fields(
-                    reward_vector,
-                    spy_correct=_spy_ok,
-                    answer_correct=float(reward_vector.get("answer", 0.0)) >= 1.0,
-                )
-                reward_scalar = audit["reward_scalar_used"]
-                if isinstance(details, dict):
-                    details.update(audit)
-                    details["routing_decision"] = buffer_name
-                    details["routing_reason"] = routing_reason
-
-                scored_example = dict(example)
-                scored_example["reward_vector"] = reward_vector
-                scored_example["failure_tags"] = failure_tags
-                scored_example["buffer"] = buffer_name
-                scored_example["routing_reason"] = routing_reason
-                scored_example["reward_scalar"] = reward_scalar
-                scored_example["reward_config_path"] = reward_config.path
-                task_scored.append(scored_example)
-
-            # SFT keeps at most one high-quality completion per task. This avoids
-            # replay being dominated by near-duplicate generations from an easy
-            # prompt while leaving every trajectory available for audit.
-            positives = [ex for ex in task_scored if ex.get("buffer") == "positive"]
-            if len(positives) > 1:
-                positives.sort(key=lambda ex: float(ex.get("reward_scalar", 0.0)), reverse=True)
-                for ex in positives[1:]:
-                    ex["buffer"] = "unused"
-                    ex["selection_reason"] = "positive_not_top1_for_task"
-
-            scored.extend(task_scored)
-            # Persist this task's rows the moment it's judged. Serial + sorted
-            # task order => the append order is a stable task_id order. flush +
-            # fsync so a hard kill can't lose an already-paid-for judgment.
-            if stream_fp is not None:
-                for _row in task_scored:
-                    stream_fp.write(json.dumps(_row, ensure_ascii=False) + "\n")
-                stream_fp.flush()
-                os.fsync(stream_fp.fileno())
+            workers = max(1, min(_answer_judge_concurrency(), len(pending)))
+            task_scored_by_id: Dict[str, List[Dict[str, Any]]] = {}
+            with tqdm(total=len(pending), desc="reward judge", unit="task") as bar:
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = {
+                        pool.submit(
+                            _score_task,
+                            task_examples,
+                            reward_config,
+                            dataset_root,
+                            default_max_reasoning_words,
+                        ): task_id
+                        for task_id, task_examples in pending
+                    }
+                    for future in as_completed(futures):
+                        task_id = futures[future]
+                        task_scored = future.result()
+                        task_scored_by_id[task_id] = task_scored
+                        # Persist this task's rows the moment it's judged. flush +
+                        # fsync so a hard kill can't lose an already-paid-for judgment.
+                        if stream_fp is not None:
+                            for _row in task_scored:
+                                stream_fp.write(json.dumps(_row, ensure_ascii=False) + "\n")
+                            stream_fp.flush()
+                            os.fsync(stream_fp.fileno())
+                        bar.update(1)
+            for task_id, _task_examples in pending:
+                scored.extend(task_scored_by_id[task_id])
     finally:
         if stream_fp is not None:
             stream_fp.close()

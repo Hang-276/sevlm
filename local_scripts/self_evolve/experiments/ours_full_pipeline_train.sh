@@ -6,8 +6,6 @@
 #   main/ours.sh  ->  lib/run_self_evolve.sh  ->  lib/common.sh
 #                                              ->  paths.sh
 #                                              ->  configs/train_defaults.sh
-# 四个文件里的路径 / 超参 / 闭环开关 / 阶段配置 / 启动逻辑，全部内联到这一个
-# 文件里，风格对齐旧库的 5a_ours_final_train.sh，方便直接读/改/跑。
 # 用法（建议 tmux）：
 #   tmux new -s ours
 #   bash local_scripts/self_evolve/experiments/ours_full_pipeline_train.sh
@@ -22,12 +20,13 @@ set -euo pipefail
 # REPO = sevlm 仓库根（从本脚本位置推导：experiments/ 向上三级）。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REPO:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
-# WORKSPACE = 数据/模型/输出的根，默认就是 sevlm 的上一级目录。
-WORKSPACE="${WORKSPACE:-$(cd "$REPO/.." && pwd)}"
+WORKSPACE="${WORKSPACE:-/jizhicfs/rtliu}"
 
-# --- conda 环境（GPU 机上使用 sevlm；无 flash-attn，代码走 sdpa）---
+# --- conda 环境（GPU 机上使用 sevlm）---
+# flash-attn 2.7.4.post1 已从官方 wheel 装进该 env（详见第 3 节 ATTN_IMPL）。
 CONDA_BASE="${CONDA_BASE:-/jizhicfs/rtliu/miniconda3}"
 CONDA_ENV="${CONDA_ENV:-sevlm}"
+WANDB_PKG_DIR="${WANDB_PKG_DIR:-/tmp/sevlm_wandb_py311}"
 if [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
   # shellcheck disable=SC1091
   source "$CONDA_BASE/etc/profile.d/conda.sh"
@@ -43,19 +42,11 @@ if [ ! -x "$PY" ]; then
   echo "[WARN] conda env '$CONDA_ENV' not found; using $PY." >&2
 fi
 
-# --- 数据 / 模型 / 输出 / reward / 评测 / Reference API ---
-# CLEVR 数据根：指向 output/ 的父目录（不是 output/ 本身）。
 DATASET_ROOT="${DATASET_ROOT:-$WORKSPACE/data/Vision-Zero-clevr-dataset}"
-BASE_MODEL="${BASE_MODEL:-$WORKSPACE/Qwen2.5-VL-7B-Instruct}"
+BASE_MODEL="${BASE_MODEL:-$WORKSPACE/models/Qwen2.5-VL-7B-Instruct}"
 # BASE_MODEL="${BASE_MODEL:-$WORKSPACE/self_evolve_runs/ours_0824_newcode_iter1/iter_000/checkpoints/grpo_qwen2_5_vl/checkpoint-90}"
 RUNS_ROOT="${RUNS_ROOT:-$WORKSPACE/self_evolve_runs}"
-# Reference VLM API：live 筛题由 GPU 机器直接请求阿里云百炼的
-# OpenAI 兼容端点 + Qwen 模型。可通过 REFERENCE_BASE_URL 覆盖端点。
-REFERENCE_BASE_URL="${REFERENCE_BASE_URL:-https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1}"
-# API key 放 .env（gitignored），或直接 export；shell 里已 export 的永远优先。
-ENV_FILE="$REPO/.env"
 
-# --- 自动派生（无需改）---
 export PYTHONPATH="$REPO/src:${PYTHONPATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 LOOP_ENTRY="$REPO/local_scripts/self_evolve/workflow/run_real_input_self_evolve_loop.py"
@@ -63,13 +54,40 @@ DEEPSPEED_CONFIG="$REPO/local_scripts/zero3.json"
 FSDP_CONFIG="$REPO/local_scripts/fsdp2_qwen2_5vl.json"
 
 # =============================================================================
-# 2) 超参（原 train_defaults.sh）。每项都可用 env 覆盖。
+# 2) API / 外部服务
 # =============================================================================
-# ---- 主实验协议（主表所有 exp 必须一致；改这里就改了训练预算）----
-LOOP_ITERATIONS="${LOOP_ITERATIONS:-2}"                 # self-evolve 轮数（出题-筛选-解题-打分-训练）
-GRPO_STEPS_PER_ITER="${GRPO_STEPS_PER_ITER:-120}"       # 每轮 GRPO 步数
+
+# ---- Reference VLM：出题把关，要读图（判题目可解 / 歧义 / 难度）----
+REFERENCE_VLM_BASE_URL="${REFERENCE_VLM_BASE_URL:-https://api.deepseek.com}"
+REFERENCE_VLM_API_KEY="${REFERENCE_VLM_API_KEY:-}"
+REFERENCE_VLM_MODEL="${REFERENCE_VLM_MODEL:-deepseek-flash}"
+REFERENCE_PROVIDER="${REFERENCE_PROVIDER:-openai}"
+
+# ---- Answer judge：GRPO 打分时兜 exact-match 的语义等价判断，纯文本、无图 ----
+# 必须带 /v1：OpenAI SDK 只往 base_url 后面拼 /chat/completions，
+# 少了 /v1 会打到 https://api.poixe.com/chat/completions → 404。
+ANSWER_JUDGE_BASE_URL="${ANSWER_JUDGE_BASE_URL:-https://api.poixe.com/v1}"
+ANSWER_JUDGE_API_KEY="${ANSWER_JUDGE_API_KEY:-}"
+ANSWER_JUDGE_MODEL="${ANSWER_JUDGE_MODEL:-gpt-4o-mini}"
+
+# ---- wandb ----
+# 和 grpo_baseline_train.sh:187 是同一把 key；轮换时两个文件都要改。
+WANDB_API_KEY="${WANDB_API_KEY:-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}"
+
+# 这些要给 loop / trainer 子进程读，必须 export。
+export REFERENCE_VLM_BASE_URL REFERENCE_VLM_API_KEY REFERENCE_VLM_MODEL \
+       REFERENCE_PROVIDER ANSWER_JUDGE_BASE_URL ANSWER_JUDGE_API_KEY \
+       ANSWER_JUDGE_MODEL WANDB_API_KEY
+
+# =============================================================================
+# 3) 超参（原 train_defaults.sh）。每项都可用 env 覆盖。
+# =============================================================================
+LOOP_ITERATIONS="${LOOP_ITERATIONS:-1}"                # self-evolve 轮数（出题-筛选-解题-打分-训练）
+GRPO_STEPS_PER_ITER="${GRPO_STEPS_PER_ITER:-240}"       # 每轮 GRPO 步数
 MAIN_NUM_GENERATIONS="${MAIN_NUM_GENERATIONS:-8}"      # GRPO group size / solver rollout n
 MAIN_NUM_TRAIN_TASKS="${MAIN_NUM_TRAIN_TASKS:-256}"     # 每轮筛选前生成的候选题目数
+# 每题给几张图。对齐 baseline 的 NUM_PLAYERS=3
+NUM_PLAYERS="${NUM_PLAYERS:-3}"
 
 NUM_ITERATIONS="${NUM_ITERATIONS:-$LOOP_ITERATIONS}"
 NUM_TRAIN_TASKS="${NUM_TRAIN_TASKS:-$MAIN_NUM_TRAIN_TASKS}"
@@ -77,21 +95,17 @@ NUM_GENERATIONS="${NUM_GENERATIONS:-$MAIN_NUM_GENERATIONS}"
 SEED="${SEED:-42}"
 MAX_STEPS="${MAX_STEPS:-60}"                            # 兜底/默认步数（未单独指定的阶段用它；也用于 banner/wandb 命名）
 NUM_GPUS="${NUM_GPUS:-8}"
-PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-2}"
-GRAD_ACCUM="${GRAD_ACCUM:-8}"
+PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-1}"
+GRAD_ACCUM="${GRAD_ACCUM:-16}"
 
 TRAINER_BACKEND="${TRAINER_BACKEND:-deepspeed}"
 
-# Reference VLM（出题把关，live 需 .env 里的 key）。看图判题目质量（可解/歧义/难度），
-# 必须是真能读图的 VLM，用较强的 qwen3.7-plus。
-REFERENCE_PROVIDER="${REFERENCE_PROVIDER:-openai}"
-REFERENCE_MODEL="${REFERENCE_MODEL:-qwen3.7-plus}"
-# Answer-judge（GRPO 打分时兜 exact-match 判答案对错）走另一条链路：纯文本、无图，
-# 只做答案语义等价判断，用更快更省的 qwen3.6-flash 即可。url/key 与 Reference 共用
-# .env 里的 OPENAI_BASE_URL / OPENAI_API_KEY（同一百炼端点），只有模型不同。
-# 解析优先级见 rewards.py:_resolve_answer_judge_endpoint：REFERENCE_VLM_MODEL 优先于
-# .env 的 OPENAI_MODEL，故下面 export 即可覆盖，且不影响 Reference VLM（它吃 --reference-model 参数）。
-ANSWER_JUDGE_MODEL="${ANSWER_JUDGE_MODEL:-qwen3.6-flash}"
+# ---- attention 实现（两个 trainer 都透传 --attn_implementation）----
+# flash-attn 2.7.4.post1（官方 wheel，torch2.6+cu124/cp311）已装在 sevlm env，
+# wheel 存 /jizhicfs/rtliu/wheels/。注意：装了包不等于启用 —— transformers 只在
+# 显式传 flag 时才用 FA2，否则仍解析成 sdpa。回退 sdpa 只需 ATTN_IMPL=sdpa。
+ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
+
 # ← 完整方法用默认 reward（五维加权）。
 REWARD_JSON="${REWARD_JSON:-$REPO/local_scripts/self_evolve/configs/reward/reward_weights.json}"
 # answer-judge 每题采样多少条 rollout 送判；必须 = NUM_GENERATIONS 才能判全每条。
@@ -99,10 +113,10 @@ ANSWER_JUDGE_SAMPLE_N="${ANSWER_JUDGE_SAMPLE_N:-$NUM_GENERATIONS}"
 
 # ---- 训练阶段（sft -> grpo 顺序执行；GRPO 从 SFT 的 checkpoint 起训）----
 # 这是 ablation 唯一该改的东西之一（另一个是 REWARD_JSON）。**已无 DPO。**
-STAGES="${STAGES:-sft,grpo}"
+STAGES="${STAGES:-grpo}"  # sft，dpo
 
 # ---- GRPO ----
-GRPO_MAX_STEPS="${GRPO_MAX_STEPS:-$GRPO_STEPS_PER_ITER}"  # GRPO 单独步数（覆盖 MAX_STEPS）
+GRPO_MAX_STEPS="${GRPO_MAX_STEPS:-$GRPO_STEPS_PER_ITER}"  # GRPO 单独步数
 GRPO_LR="${GRPO_LR:-1e-6}"
 GRPO_WARMUP_RATIO="${GRPO_WARMUP_RATIO:-0.1}"
 GRPO_LR_SCHEDULER="${GRPO_LR_SCHEDULER:-cosine}"
@@ -111,8 +125,9 @@ GRPO_WEIGHT_DECAY="${GRPO_WEIGHT_DECAY:-0.0}"
 GRPO_TEMPERATURE="${GRPO_TEMPERATURE:-1.0}"              # rollout 采样温度
 GRPO_MAX_PROMPT_LEN="${GRPO_MAX_PROMPT_LEN:-10240}"      # 要放得下 num_players 张图 + prompt 文本
 GRPO_MAX_COMPLETION_LEN="${GRPO_MAX_COMPLETION_LEN:-2048}"  # 库默认 256 放不下五图对比 CoT + 尾部 <bbox>
-GRPO_MIN_PIXELS="${GRPO_MIN_PIXELS:-802816}"            # 256*28*28（降分辨率省显存：视觉 attention 是全量 SDPA，8 图叠加时 seq² 会 OOM）
-GRPO_MAX_PIXELS="${GRPO_MAX_PIXELS:-1003520}"            # 640*28*28（原 1280 太高，8-player 题 visual attention 爆到 ~1.6TB；CLEVR 物体在此分辨率仍可辨）
+# 分辨率对齐 baseline 的 GRPO_MIN/MAX_PIXELS
+GRPO_MIN_PIXELS="${GRPO_MIN_PIXELS:-602112}"            # 768*28*28
+GRPO_MAX_PIXELS="${GRPO_MAX_PIXELS:-1003520}"           # 1280*28*28（CLEVR 物体在此分辨率仍可辨）
 GRPO_SCALE_REWARDS="${GRPO_SCALE_REWARDS:-False}"        # Dr.GRPO：减组均值但不除 std
 GRPO_OVERLONG_FILTERING="${GRPO_OVERLONG_FILTERING:-True}"  # 被 max_completion_length 截断（无 EOS）的 rollout 给 0 advantage
 GRPO_DYNAMIC_SAMPLING="${GRPO_DYNAMIC_SAMPLING:-True}"
@@ -121,7 +136,7 @@ GRPO_DYNAMIC_STD_THRESHOLD="${GRPO_DYNAMIC_STD_THRESHOLD:-0.02}"
 GRPO_DYNAMIC_MAX_RETRIES="${GRPO_DYNAMIC_MAX_RETRIES:-3}"
 
 # ---- SFT（replay 数据监督微调）----
-SFT_MAX_STEPS="${SFT_MAX_STEPS:-2}"                      # SFT 单独步数（覆盖 MAX_STEPS）
+SFT_MAX_STEPS="${SFT_MAX_STEPS:-2}"                      # SFT 单独步数
 SFT_LR="${SFT_LR:-1e-6}"
 SFT_WARMUP_RATIO="${SFT_WARMUP_RATIO:-0.0}"
 SFT_LR_SCHEDULER="${SFT_LR_SCHEDULER:-cosine}"
@@ -153,7 +168,7 @@ SOLVER_TOP_P="${SOLVER_TOP_P:-0.95}"
 # non-reentrant checkpointing：8 卡 DDP 下 reentrant 会把同一参数 mark ready 两次。
 GC_KWARGS="${GC_KWARGS:---gradient_checkpointing_kwargs '{\"use_reentrant\": false}'}"
 CLIP="${CLIP:---max_grad_norm 0.3}"                     # 梯度裁剪，防 bf16 全参 grad_norm 突然 nan 打崩权重
-SAVE_STEPS="${SAVE_STEPS:-10}"
+SAVE_STEPS="${SAVE_STEPS:-40}"
 
 # ---- 组装各阶段透传串（主入口把这些 append 到各自命令末尾，覆盖内置默认）----
 GRPO_STEPS_ARG=""; [ -n "${GRPO_MAX_STEPS:-}" ] && GRPO_STEPS_ARG="--max_steps $GRPO_MAX_STEPS"
@@ -161,6 +176,7 @@ GRPO_EXTRA="$GRPO_STEPS_ARG --learning_rate $GRPO_LR --warmup_ratio $GRPO_WARMUP
 --lr_scheduler_type $GRPO_LR_SCHEDULER --beta $GRPO_BETA \
 --max_prompt_length $GRPO_MAX_PROMPT_LEN --max_completion_length $GRPO_MAX_COMPLETION_LEN \
 --min_pixels $GRPO_MIN_PIXELS --max_pixels $GRPO_MAX_PIXELS \
+--attn_implementation $ATTN_IMPL \
 --weight_decay $GRPO_WEIGHT_DECAY --temperature $GRPO_TEMPERATURE \
 --scale_rewards $GRPO_SCALE_REWARDS --overlong_filtering $GRPO_OVERLONG_FILTERING \
 --dynamic_sampling $GRPO_DYNAMIC_SAMPLING --dynamic_sampling_mode $GRPO_DYNAMIC_MODE \
@@ -171,18 +187,17 @@ GRPO_EXTRA="$GRPO_STEPS_ARG --learning_rate $GRPO_LR --warmup_ratio $GRPO_WARMUP
 SFT_STEPS_ARG=""; [ -n "${SFT_MAX_STEPS:-}" ] && SFT_STEPS_ARG="--max_steps $SFT_MAX_STEPS"
 SFT_EXTRA="$SFT_STEPS_ARG --learning_rate $SFT_LR --warmup_ratio $SFT_WARMUP_RATIO \
 --lr_scheduler_type $SFT_LR_SCHEDULER --per_device_train_batch_size $SFT_PER_DEVICE_BATCH \
---weight_decay $SFT_WEIGHT_DECAY --save_steps 2 $CLIP $GC_KWARGS"
+--weight_decay $SFT_WEIGHT_DECAY --save_steps 2 $CLIP $GC_KWARGS \
+--attn_implementation $ATTN_IMPL"
 
 # =============================================================================
-# 3) 小工具（原 common.sh 里用到的三个函数）
+# 4) 小工具（原 common.sh 里用到的三个函数）
 # =============================================================================
 banner() {
   echo "======================================================"
   echo "  $*"
   echo "======================================================"
 }
-# 载入 .env（API key 等）；shell 里已 export 的优先。
-load_env() { [ -f "$ENV_FILE" ] && { set -a; . "$ENV_FILE"; set +a; }; }
 # 前置存在性检查：占位路径在这里就报错，而不是训练跑一半才崩。
 require_paths() {
   case "$WORKSPACE" in */PATH/TO/*) echo "[ERROR] WORKSPACE 还是占位符，先填真实路径" >&2; exit 2;; esac
@@ -191,26 +206,40 @@ require_paths() {
   [ -e "$BASE_MODEL" ] || { echo "[ERROR] BASE_MODEL 不存在: $BASE_MODEL（先下 Qwen2.5-VL-7B-Instruct）" >&2; exit 2; }
 }
 
+# 凭据检查（第 2 节声明）。空值在这里就报错，而不是等 Reference VLM 筛题时才崩。
+require_api_keys() {
+  [ -n "$REFERENCE_VLM_API_KEY" ] || {
+    echo "[ERROR] REFERENCE_VLM_API_KEY 为空（Reference VLM 出题把关要用）。填在第 2 节，或跑之前 export。" >&2
+    exit 2
+  }
+  [ -n "$ANSWER_JUDGE_API_KEY" ] || {
+    echo "[ERROR] ANSWER_JUDGE_API_KEY 为空（GRPO 打分的 answer judge 要用）。填在第 2 节，或跑之前 export。" >&2
+    exit 2
+  }
+  [ -n "$REFERENCE_VLM_BASE_URL" ] || { echo "[ERROR] REFERENCE_VLM_BASE_URL 为空" >&2; exit 2; }
+  [ -n "$ANSWER_JUDGE_BASE_URL" ]  || { echo "[ERROR] ANSWER_JUDGE_BASE_URL 为空" >&2; exit 2; }
+}
+
 require_paths
-load_env
+require_api_keys
 [ -f "$REWARD_JSON" ] || { echo "[ERROR] reward 配置不存在: $REWARD_JSON" >&2; exit 2; }
 
 # ---- RUN_TAG（固定名，不带时间戳；OUT_DIR 存在则自动两级续跑）----
 # 起新实验：换名字（新目录自然从头跑）。强制重头跑同目录：SELF_EVOLVE_DISABLE_RESUME=1。
-RUN_TAG="${RUN_TAG:-ours_0824_newcode}"
+RUN_TAG="${RUN_TAG:-ours_0926}"
 OUT_DIR="$RUNS_ROOT/$RUN_TAG"
 mkdir -p "$OUT_DIR"
 
 # =============================================================================
-# 4) 闭环机制的环境开关
+# 5) 闭环机制的环境开关
 # =============================================================================
 export SELF_EVOLVE_TOO_HARD_GAP="${SELF_EVOLVE_TOO_HARD_GAP:-2}"
 export SELF_EVOLVE_ANSWER_JUDGE="${SELF_EVOLVE_ANSWER_JUDGE:-1}"
 export SELF_EVOLVE_ANSWER_JUDGE_LIVE="${SELF_EVOLVE_ANSWER_JUDGE_LIVE:-1}"
 export SELF_EVOLVE_ANSWER_JUDGE_FORCE="${SELF_EVOLVE_ANSWER_JUDGE_FORCE:-0}"
 export SELF_EVOLVE_ANSWER_JUDGE_SAMPLE_N="${SELF_EVOLVE_ANSWER_JUDGE_SAMPLE_N:-$ANSWER_JUDGE_SAMPLE_N}"
-# Answer-judge 专用模型（覆盖 .env 的 OPENAI_MODEL；不影响 Reference VLM）。
-export REFERENCE_VLM_MODEL="${REFERENCE_VLM_MODEL:-$ANSWER_JUDGE_MODEL}"
+export SELF_EVOLVE_ANSWER_JUDGE_CONCURRENCY="${SELF_EVOLVE_ANSWER_JUDGE_CONCURRENCY:-16}"
+# （answer judge 的 endpoint / 模型 / key 已在第 2 节统一声明。）
 
 # GRPO 每-step 轨迹+打分落盘（默认开）。每 step 一个文件夹，8 卡各写各的 rankN.jsonl。
 # 关掉：export SELF_EVOLVE_GRPO_DUMP_DIR=（置空）。
@@ -220,15 +249,27 @@ export SELF_EVOLVE_GRPO_DUMP_DIR="${SELF_EVOLVE_GRPO_DUMP_DIR:-$OUT_DIR/grpo_dum
 export SELF_EVOLVE_GRPO_EXTRA_ARGS="$GRPO_EXTRA"
 export SELF_EVOLVE_SFT_EXTRA_ARGS="$SFT_EXTRA"
 
-# --- wandb 训练曲线（默认开；WANDB=0 关闭。key 放 .env 的 WANDB_API_KEY）---
+# --- wandb 训练曲线（默认开；WANDB=0 关闭。key 在第 2 节声明）---
 if [ "${WANDB:-1}" = "1" ]; then
+  # 对齐 baseline：conda env 自带的 wandb 在这台机器上不能用，login 和 trainer
+  # 都从 $WANDB_PKG_DIR 的 staged 包加载。加载/登录失败直接退出，不跑一个没有
+  # 曲线的训练（baseline 也是 fail-hard）。
+  [ -d "$WANDB_PKG_DIR/wandb" ] || {
+    echo "[ERROR] W&B package not found: $WANDB_PKG_DIR/wandb" >&2
+    exit 2
+  }
+  export PYTHONPATH="$WANDB_PKG_DIR:$PYTHONPATH"
   export SELF_EVOLVE_REPORT_TO=wandb
   export WANDB_PROJECT="${WANDB_PROJECT:-self-evolve-vlm}"
-  export WANDB_NAME="${WANDB_NAME:-ours_${NUM_ITERATIONS}iters_${MAX_STEPS}step}"
-  : "${WANDB_API_KEY:?WANDB=1 需要 WANDB_API_KEY（放 $ENV_FILE 或先 wandb login）}"
-  # 跑前自动 login（幂等；已登录会直接复用）。失败不致命，训练照跑（离线缓存）。
-  wandb login --relogin "$WANDB_API_KEY" 2>/dev/null \
-    && echo "[wandb] logged in" || echo "[wandb] login skipped/failed（训练继续）" >&2
+  # 用每轮步数命名（MAX_STEPS=60 只是兜底值，拿它命名会误导）。
+  export WANDB_NAME="${WANDB_NAME:-ours_${NUM_ITERATIONS}iters_${GRPO_MAX_STEPS}step}"
+  : "${WANDB_API_KEY:?WANDB=1 需要 WANDB_API_KEY（填在第 2 节，或 export；不想用 wandb 就 WANDB=0）}"
+  echo "[wandb] package=$WANDB_PKG_DIR"
+  "$PY" -m wandb login --relogin "$WANDB_API_KEY" || {
+    echo "[ERROR] W&B login failed; refusing to start an untracked training run." >&2
+    exit 2
+  }
+  echo "[wandb] logged in"
   echo "[wandb] project=$WANDB_PROJECT name=$WANDB_NAME"
 else
   export SELF_EVOLVE_REPORT_TO=none
@@ -239,7 +280,7 @@ if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
 fi
 
 # =============================================================================
-# 5) 组装 loop 入口参数（内联 stage_cli_args / solver_cli_args / generator_cli_args）
+# 6) 组装 loop 入口参数（内联 stage_cli_args / solver_cli_args / generator_cli_args）
 # =============================================================================
 ARGS=(
   --dataset-root "$DATASET_ROOT"
@@ -250,10 +291,11 @@ ARGS=(
   --allow-more-than-two-iterations
   --num-train-tasks "$NUM_TRAIN_TASKS"
   --num-generations "$NUM_GENERATIONS"
+  --num-players "$NUM_PLAYERS"
   --seed "$SEED"
   --reference-provider "$REFERENCE_PROVIDER"
-  --reference-model "$REFERENCE_MODEL"
-  --reference-base-url "$REFERENCE_BASE_URL"
+  --reference-model "$REFERENCE_VLM_MODEL"
+  --reference-base-url "$REFERENCE_VLM_BASE_URL"
   --enable-openai-reference-vlm
   --max-trainer-steps "$MAX_STEPS"
   --trainer-num-gpus "$NUM_GPUS"
@@ -305,9 +347,9 @@ banner "train  self-evolve loop（完整方法 ours，全链路：出题/self-pl
   RUN_TAG=$RUN_TAG
   OUT_DIR=$OUT_DIR
   CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES
-  iters=$NUM_ITERATIONS tasks=$NUM_TRAIN_TASKS gen=$NUM_GENERATIONS steps=$MAX_STEPS gpus=$NUM_GPUS mode=FULL-PARAM(GRPO=$([ "$TRAINER_BACKEND" = fsdp2 ] && echo "fsdp2=$(basename "$FSDP_CONFIG")" || echo "deepspeed=$(basename "$DEEPSPEED_CONFIG")"); SFT=deepspeed=$(basename "$DEEPSPEED_CONFIG"))
-  stages=$STAGES  (sft=$SFT_MAX_STEPS grpo=$GRPO_MAX_STEPS step)
-  reward=$REWARD_JSON  reference=$REFERENCE_MODEL(live)  answer_judge=$REFERENCE_VLM_MODEL(live)"
+  iters=$NUM_ITERATIONS tasks=$NUM_TRAIN_TASKS players=$NUM_PLAYERS gen=$NUM_GENERATIONS gpus=$NUM_GPUS mode=FULL-PARAM(GRPO=$([ "$TRAINER_BACKEND" = fsdp2 ] && echo "fsdp2=$(basename "$FSDP_CONFIG")" || echo "deepspeed=$(basename "$DEEPSPEED_CONFIG")"); SFT=deepspeed=$(basename "$DEEPSPEED_CONFIG"))
+  stages=$STAGES  (sft=$SFT_MAX_STEPS grpo=$GRPO_MAX_STEPS step/iter → 累计 $((NUM_ITERATIONS * GRPO_MAX_STEPS)) grpo step, $((NUM_ITERATIONS * NUM_TRAIN_TASKS)) 题)
+  reward=$REWARD_JSON  reference=$REFERENCE_VLM_MODEL(live)  answer_judge=$ANSWER_JUDGE_MODEL(live)"
 
 cd "$REPO"
 # resume 场景保留历史 log：append 而非覆盖（-a）。

@@ -19,8 +19,6 @@ set -euo pipefail
 # =============================================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REPO:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
-# This checkout lives at $WORKSPACE/self-vlm/sevlm on the current machine.
-# Keep WORKSPACE overridable so the script remains portable.
 WORKSPACE="${WORKSPACE:-/jizhicfs/rtliu}"
 
 # --- conda 环境 ---
@@ -63,12 +61,8 @@ DEEPSPEED_CONFIG="$REPO/local_scripts/zero3.json"
 FSDP_CONFIG="$REPO/local_scripts/fsdp2_qwen2_5vl.json"
 
 # =============================================================================
-# 2) 超参（与 ours_full_pipeline_train.sh 逐项对齐；只差迭代结构 + reward + 闭环开关）
+# 2) 超参（
 # =============================================================================
-# ---- 主实验协议 ----
-# baseline 是单轮 GRPO：NUM_ITERATIONS=1。训练预算 MAX_STEPS 必须 = ours 全部
-# 迭代累计的 GRPO 总步数（ours: LOOP_ITERATIONS * GRPO_STEPS_PER_ITER）。默认 2000
-# 供你先跑、过拟合早停；改这里就改了预算，主表两边要一致。
 NUM_ITERATIONS="${NUM_ITERATIONS:-1}"
 MAX_STEPS="${MAX_STEPS:-2000}"                          # 单轮 GRPO 总步数（= ours 累计步数）
 # 题量：对齐 ours 整个 run 的累计题量（默认 10 轮 × 256 = 2560），单轮一次性出题。
@@ -113,7 +107,7 @@ SOLVER_TOP_P="${SOLVER_TOP_P:-0.95}"
 # ---- GRPO 共用 ----
 GC_KWARGS="${GC_KWARGS:---gradient_checkpointing_kwargs '{\"use_reentrant\": false}'}"
 CLIP="${CLIP:---max_grad_norm 0.3}"                     # 梯度裁剪，防 bf16 全参 grad_norm 突然 nan
-SAVE_STEPS="${SAVE_STEPS:-10}"
+SAVE_STEPS="${SAVE_STEPS:-50}"
 
 # ---- 组装 GRPO 透传串（主入口 append 到命令末尾，覆盖内置默认）----
 GRPO_STEPS_ARG=""; [ -n "${GRPO_MAX_STEPS:-}" ] && GRPO_STEPS_ARG="--max_steps $GRPO_MAX_STEPS"
