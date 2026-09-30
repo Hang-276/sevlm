@@ -1,8 +1,5 @@
 # experiments
 
-**负责实验①和③的新合作者：先读 [COLLABORATOR_START_HERE.md](COLLABORATOR_START_HERE.md)。**
-该文档先解释研究问题和实验分工，再给出独立训练、统一评测及结果交付步骤。
-
 Four directories, one per kind of experiment. `lib/` holds the shared sevlm
 runners. Most wrappers set a few variables and call those runners.
 Experiment 3 is independent: `main/vision_zero_baseline.sh` launches a pinned
@@ -65,8 +62,8 @@ highest-numbered checkpoint), or a directory that already is a full model.
 `main/eval.sh` is the legacy shared entry; with no run_dir it uses the most
 recent recorded run (`MARKER=xxx` selects one). Experiments 1 and 3 now use
 the isolated `analysis/eval_checkpoint.sh` with explicit model paths and
-saved evaluation configs. Follow [the collaborator guide](COLLABORATOR_START_HERE.md)
-and use the same explicit datasets, decoding and judge for all five rows;
+saved evaluation configs. Use the same explicit datasets, decoding and judge
+for all five rows;
 do not assume the legacy defaults equal the new evaluator's explicit settings.
 
 ## ablation

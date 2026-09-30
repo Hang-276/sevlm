@@ -10,8 +10,7 @@
 
 `analysis/eval_checkpoint.sh <完整模型目录>` 的默认列表及映射支持 10 个 benchmark。
 路径推导和环境变量覆盖问题已修复；独立入口不再 source 训练环境或依赖可选 `.env`。
-支持 `DRY_RUN=1` 保存评测配置但不启动模型。具体操作见
-[COLLABORATOR_START_HERE.md](COLLABORATOR_START_HERE.md)。
+支持 `DRY_RUN=1` 保存评测配置但不启动模型。
 
 | Benchmark 配置名 | 主表入口（6项） | 单 checkpoint 入口（10项） | 主要任务 |
 |---|---|---|---|

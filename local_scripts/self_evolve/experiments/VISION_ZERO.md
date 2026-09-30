@@ -151,7 +151,6 @@ export VISION_ZERO_PROTOCOL=main_ours
 使用独立 `analysis/eval_checkpoint.sh "$VISION_ZERO_OUTPUT"`，设置 `LABEL=vision_zero`。
 该入口的路径、变量覆盖和 `.env` 处理已修复，经过无GPU启动回归检查；①也使用同一评测器。
 默认 benchmark 数量仍不同，必须显式统一 `DATASETS`、解码和 judge。
-完整命令见 [合作者上手说明](COLLABORATOR_START_HERE.md)。
 主实验训练和旧公共评测入口未改动；独立入口不使用公共 `load_env`。
 
 论文可写为“使用官方 Vision-Zero 实现，并对齐共同训练超参数及累计 GRPO 更新数”。

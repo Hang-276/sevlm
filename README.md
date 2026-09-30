@@ -1,8 +1,5 @@
 # Self-evolving VLM visual reasoning agent
 
-**新合作者从这里开始：** [理解研究并完成实验①和③（中文）](local_scripts/self_evolve/experiments/COLLABORATOR_START_HERE.md)。
-这份说明包含五组实验的关系、数据区别、独立环境、启动步骤、当前脚本限制和交付清单。
-
 A closed training loop on the CLEVR spot-the-difference task. The model sets
 its own puzzles and then solves them: it picks which of a scene's changed
 objects stay changed, splicing turns that pick into a task whose answer is
