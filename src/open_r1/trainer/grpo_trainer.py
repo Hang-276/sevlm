@@ -13,15 +13,15 @@
 # limitations under the License.
 
 import json
+import math
 import os
-import textwrap
 from collections import defaultdict
 from typing import Any, Callable, Optional, Union, Sized
 
 import torch
 import torch.utils.data
 import transformers
-from datasets import Dataset, IterableDataset
+from datasets import Dataset
 from packaging import version
 from transformers import (
     AriaForConditionalGeneration,
@@ -47,6 +47,7 @@ from transformers.utils import is_peft_available
 from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
 from .grpo_config import GRPOConfig
+from .grpo_loss import reduce_grpo_loss
 from trl.trainer.utils import generate_model_card, get_comet_experiment_url
 # from trl import GRPOTrainer
 
@@ -54,7 +55,7 @@ from accelerate.utils import is_peft_model, set_seed
 import PIL.Image
 
 import copy
-from torch.utils.data import Sampler
+from torch.utils.data import IterableDataset, Sampler
 import warnings
 import re
 
@@ -65,30 +66,66 @@ if is_wandb_available():
     import wandb
 
 from open_r1.vlm_modules.vlm_module import VLMBaseModule
+from open_r1.qwen_pixels import configure_qwen_image_pixels, qwen_pixel_limits
 from .dynamic_dataset import DynamicIterableDataset, EpochAwareIterableDataset, CyclicDynamicDataset
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 
 
-class CyclicRepeatSampler(Sampler):
-    """
-    Sampler that ensures the same samples are used within each num_iterations cycle.
-    This is specifically designed for GRPO where we want to avoid regenerating images
-    within the same optimization cycle.
+REWARD_TASK_KINDS = ("clevr_spy", "verified_count_qa")
+REWARD_BREAKDOWN_METRICS = (
+    "answer", "grounding", "process", "consistency", "budget",
+    "answer_correct", "format_valid", "samples",
+)
 
-    Args:
-        data_source (`Sized`):
-            Dataset to sample from.
-        mini_repeat_count (`int`):  
-            Number of times to repeat each index (num_generations)
-        batch_size (`int`):
-            Number of unique indices per batch.
-        cycle_length (`int`):
-            Length of each cycle (num_iterations)
-        seed (`int` or `None`, *optional*, defaults to `None`):
-            Random seed for reproducibility.
-    """
+
+def reward_breakdown_sums(breakdowns, device="cpu") -> torch.Tensor:
+    """Exclude missing dimensions; keep fixed kind rows for rank-safe sum/count gathering."""
+    stats = [
+        [[0.0, 0.0] for _ in REWARD_BREAKDOWN_METRICS]
+        for _ in range(1 + len(REWARD_TASK_KINDS))
+    ]
+    for breakdown in breakdowns or []:
+        if not isinstance(breakdown, dict):
+            continue
+        kind = breakdown.get("task_kind", "clevr_spy")
+        rows = [0]
+        if kind in REWARD_TASK_KINDS:
+            rows.append(1 + REWARD_TASK_KINDS.index(kind))
+        for metric_index, metric in enumerate(REWARD_BREAKDOWN_METRICS):
+            if metric == "samples":
+                value = 1.0
+            elif metric == "answer_correct":
+                value = breakdown.get("answer_exact_match")
+            else:
+                value = breakdown.get(metric)
+            if value is None:
+                continue
+            try:
+                value = float(value)
+            except (ValueError, TypeError, OverflowError):
+                continue
+            if not math.isfinite(value):
+                continue
+            for row in rows:
+                stats[row][metric_index][0] += value
+                stats[row][metric_index][1] += 1
+    return torch.tensor(stats, device=device, dtype=torch.float32)
+
+
+def grouped_reward_stats(rewards, num_generations):
+    if num_generations < 2 or rewards.numel() % num_generations:
+        raise ValueError("Reward rows must form complete groups of at least two generations")
+    grouped = rewards.reshape(-1, num_generations)
+    means, stds = grouped.mean(dim=1), grouped.std(dim=1)
+    if not all(torch.isfinite(tensor).all() for tensor in (rewards, means, stds)):
+        raise FloatingPointError("Non-finite GRPO rewards or group statistics")
+    return means, stds
+
+
+class CyclicRepeatSampler(Sampler):
+    """Repeat update batches with adjacent generations and reproducible epoch ordering."""
 
     def __init__(
         self,
@@ -103,16 +140,21 @@ class CyclicRepeatSampler(Sampler):
         self.batch_size = batch_size
         self.cycle_length = cycle_length
         self.num_samples = len(data_source)
-        self.seed = seed
         self.generator = torch.Generator()
-        if seed is not None:
-            self.generator.manual_seed(seed)
+        self.seed = self.generator.seed() if seed is None else seed
+        self.epoch = 0
+        for name in ("mini_repeat_count", "batch_size", "cycle_length"):
+            if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.num_samples < self.batch_size:
+            raise ValueError("Dataset must contain at least one complete GRPO batch")
         
         # Pre-generate the sample order for the entire cycle
         self._generate_cycle_samples()
 
     def _generate_cycle_samples(self):
         """Generate samples for one complete cycle."""
+        self.generator.manual_seed(self.seed + self.epoch)
         # Generate random indices for this cycle
         indexes = torch.randperm(self.num_samples, generator=self.generator).tolist()
         
@@ -133,6 +175,9 @@ class CyclicRepeatSampler(Sampler):
                     for _ in range(self.mini_repeat_count):
                         self.cycle_samples.append(index)
 
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
     def __iter__(self):
         # Regenerate samples for each epoch
         self._generate_cycle_samples()
@@ -146,130 +191,20 @@ class CyclicRepeatSampler(Sampler):
 
 
 class FiniteLogitsProcessor(LogitsProcessor):
-    """A-3 rollout logits fallback.
-
-    HF `generate` samples via `multinomial`, which triggers a CUDA device-side assert
-    ("probability tensor contains either inf, nan or element < 0") and crashes every rank
-    if the next-token logits contain nan/inf. When A-1/A-2 fail to catch a poisoned weight,
-    this scrubs the logits right before sampling so a bad rollout degrades to a plausible
-    token instead of taking down all 8 GPUs. nan -> very negative (unpicked), +inf -> a large
-    finite value, -inf left as is. If a whole row is non-finite we reset it to uniform so
-    multinomial always sees a valid distribution.
-
-    It also hard-bans a set of special tokens (the image/video/vision markers) from being
-    sampled: even after scrubbing, a uniform-reset row could sample e.g. `<|image_pad|>`
-    (151655), which then makes the image-token count in prompt+completion exceed the number
-    of vision features and raises "Image features and image tokens do not match". Setting
-    those logits to -inf guarantees they can never appear in a completion."""
+    """Keep sampling finite while excluding multimodal placeholder tokens."""
 
     def __init__(self, banned_token_ids=None):
         super().__init__()
-        # Store as a plain list; converted to a tensor lazily on the scores' device.
         self.banned_token_ids = [int(t) for t in (banned_token_ids or []) if t is not None]
-        self._banned_index = None  # cached LongTensor on the scores device
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-        non_finite = not torch.isfinite(scores).all()
-        if non_finite:
-            scores = torch.nan_to_num(scores, nan=-1e9, posinf=1e4, neginf=-1e9)
-            # Guard against an all-(-1e9) row (e.g. originally all-nan) producing a degenerate softmax.
-            bad_rows = ~torch.isfinite(scores).any(dim=-1) | (scores.max(dim=-1).values <= -1e9)
-            if bad_rows.any():
-                scores[bad_rows] = 0.0  # uniform logits -> uniform sampling for that row
-        # Ban the special tokens unconditionally (applied after any uniform reset so the
-        # reset can't re-open them). Cheap masked_fill on a tiny index tensor.
-        if self.banned_token_ids:
-            if self._banned_index is None or self._banned_index.device != scores.device:
-                self._banned_index = torch.tensor(
-                    self.banned_token_ids, dtype=torch.long, device=scores.device
-                )
-            scores[:, self._banned_index] = float("-inf")
-        return scores
+        from .vllm_rollout import finite_rollout_logits
+
+        return finite_rollout_logits(scores, self.banned_token_ids)
 
 
 class VLMGRPOTrainer(Trainer):
-    """
-    Trainer for the Group Relative Policy Optimization (GRPO) method. This algorithm was initially proposed in the
-    paper [DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models](https://huggingface.co/papers/2402.03300).
-
-    Example:
-
-    ```python
-    from datasets import load_dataset
-    from trl import GRPOTrainer
-
-    dataset = load_dataset("trl-lib/tldr", split="train")
-
-    trainer = GRPOTrainer(
-        model="Qwen/Qwen2-0.5B-Instruct",
-        reward_funcs="weqweasdas/RM-Gemma-2B",
-        train_dataset=dataset,
-    )
-
-    trainer.train()
-    ```
-
-    Args:
-        model (`Union[str, PreTrainedModel]`):
-            Model to be trained. Can be either:
-
-            - A string, being the *model id* of a pretrained model hosted inside a model repo on huggingface.co, or
-              a path to a *directory* containing model weights saved using
-              [`~transformers.PreTrainedModel.save_pretrained`], e.g., `'./my_model_directory/'`. The model is
-              loaded using [`~transformers.AutoModelForCausalLM.from_pretrained`] with the keywork arguments
-              in `args.model_init_kwargs`.
-            - A [`~transformers.PreTrainedModel`] object. Only causal language models are supported.
-        reward_funcs (`Union[RewardFunc, list[RewardFunc]]`):
-            Reward functions to be used for computing the rewards. To compute the rewards, we call all the reward
-            functions with the prompts and completions and sum the rewards. Can be either:
-
-            - A single reward function, such as:
-                - A string: The *model ID* of a pretrained model hosted inside a model repo on huggingface.co, or a
-                path to a *directory* containing model weights saved using
-                [`~transformers.PreTrainedModel.save_pretrained`], e.g., `'./my_model_directory/'`. The model is loaded
-                using [`~transformers.AutoModelForSequenceClassification.from_pretrained`] with `num_labels=1` and the
-                keyword arguments in `args.model_init_kwargs`.
-                - A [`~transformers.PreTrainedModel`] object: Only sequence classification models are supported.
-                - A custom reward function: The function is provided with the prompts and the generated completions,
-                  plus any additional columns in the dataset. It should return a list of rewards. For more details, see
-                  [Using a custom reward function](#using-a-custom-reward-function).
-            - A list of reward functions, where each item can independently be any of the above types. Mixing different
-            types within the list (e.g., a string model ID and a custom reward function) is allowed.
-        args ([`GRPOConfig`], *optional*, defaults to `None`):
-            Configuration for this trainer. If `None`, a default configuration is used.
-        train_dataset ([`~datasets.Dataset`] or [`~datasets.IterableDataset`]):
-            Dataset to use for training. It must include a column `"prompt"`. Any additional columns in the dataset is
-            ignored. The format of the samples can be either:
-
-            - [Standard](dataset_formats#standard): Each sample contains plain text.
-            - [Conversational](dataset_formats#conversational): Each sample contains structured messages (e.g., role
-              and content).
-        eval_dataset ([`~datasets.Dataset`], [`~datasets.IterableDataset`] or `dict[str, Union[Dataset, IterableDataset]]`):
-            Dataset to use for evaluation. It must meet the same requirements as `train_dataset`.
-        processing_class ([`~transformers.PreTrainedTokenizerBase`], *optional*, defaults to `None`):
-            Processing class used to process the data. The padding side must be set to "left". If `None`, the
-            processing class is loaded from the model's name with [`~transformers.AutoTokenizer.from_pretrained`].
-        reward_processing_classes (`Union[PreTrainedTokenizerBase, list[PreTrainedTokenizerBase]]`, *optional*, defaults to `None`):
-            Processing classes corresponding to the reward functions specified in `reward_funcs`. Can be either:
-
-            - A single processing class: Used when `reward_funcs` contains only one reward function.
-            - A list of processing classes: Must match the order and length of the reward functions in `reward_funcs`.
-            If set to `None`, or if an element of the list corresponding to a [`~transformers.PreTrainedModel`] is
-            `None`, the tokenizer for the model is automatically loaded using [`~transformers.AutoTokenizer.from_pretrained`].
-            For elements in `reward_funcs` that are custom reward functions (not [`~transformers.PreTrainedModel`]),
-            the corresponding entries in `reward_processing_classes` are ignored.
-        callbacks (list of [`~transformers.TrainerCallback`], *optional*, defaults to `None`):
-            List of callbacks to customize the training loop. Will add those to the list of default callbacks
-            detailed in [here](https://huggingface.co/docs/transformers/main_classes/callback).
-
-            If you want to remove one of the default callbacks used, use the [`~transformers.Trainer.remove_callback`]
-            method.
-        optimizers (`tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]`, *optional*, defaults to `(None, None)`):
-            A tuple containing the optimizer and the scheduler to use. Will default to an instance of [`AdamW`] on your
-            model and a scheduler given by [`get_linear_schedule_with_warmup`] controlled by `args`.
-        peft_config ([`~peft.PeftConfig`], *optional*, defaults to `None`):
-            PEFT configuration used to wrap the model. If `None`, the model is not wrapped.
-    """
+    """Train multimodal policies with grouped rewards and replayed rollouts."""
 
     def __init__(
         self,
@@ -295,6 +230,27 @@ class VLMGRPOTrainer(Trainer):
             model_name = model if isinstance(model, str) else model.config._name_or_path
             model_name = model_name.split("/")[-1]
             args = GRPOConfig(f"{model_name}-GRPO")
+        self.loss_type = getattr(args, "loss_type", "grpo")
+        self.loss_normalization_length = getattr(args, "loss_normalization_length", None)
+        if self.loss_type not in {"grpo", "dr_grpo"}:
+            raise ValueError(f"Unsupported GRPO loss_type: {self.loss_type!r}")
+        if self.loss_normalization_length is not None:
+            if self.loss_type != "dr_grpo":
+                raise ValueError("loss_normalization_length is only supported with loss_type=dr_grpo")
+            if (
+                not isinstance(self.loss_normalization_length, int)
+                or isinstance(self.loss_normalization_length, bool)
+                or self.loss_normalization_length <= 0
+            ):
+                raise ValueError("loss_normalization_length must be a positive integer")
+        if self.loss_type == "dr_grpo" and (
+            not isinstance(args.max_completion_length, int)
+            or isinstance(args.max_completion_length, bool)
+            or args.max_completion_length <= 0
+        ):
+            raise ValueError("dr_grpo requires a positive integer max_completion_length")
+        if args.n_gpu > 1:
+            raise ValueError("Multimodal GRPO requires one GPU per process; use torchrun or expose one GPU")
         
         self.vlm_module = vlm_module
 
@@ -402,14 +358,21 @@ class VLMGRPOTrainer(Trainer):
                     # If we cannot find component in processing_class, return the processing_class itself
                     processing_component = getattr(processing_class, component, processing_class)
                     setattr(processing_component, processing_keyword, kwargs[processing_keyword])
-            if getattr(processing_class, "tokenizer",  None) is not None:
-                pad_token_id = processing_class.tokenizer.pad_token_id
-                processing_class.pad_token_id = pad_token_id
-                processing_class.eos_token_id = processing_class.tokenizer.eos_token_id
-            else:
-                assert isinstance(processing_class, PreTrainedTokenizerBase), "processing_class must be an instance of PreTrainedTokenizerBase if it has no tokenizer attribute"
-                pad_token_id = processing_class.pad_token_id
+        if getattr(processing_class, "tokenizer", None) is not None:
+            pad_token_id = processing_class.tokenizer.pad_token_id
+            processing_class.pad_token_id = pad_token_id
+            processing_class.eos_token_id = processing_class.tokenizer.eos_token_id
+        else:
+            assert isinstance(processing_class, PreTrainedTokenizerBase), "processing_class must be an instance of PreTrainedTokenizerBase if it has no tokenizer attribute"
+            pad_token_id = processing_class.pad_token_id
 
+        if self.vlm_module.get_vlm_key() == "qwen":
+            # The generic keyword hook sets historical attrs. Qwen fast
+            # preprocessing reads size instead, so synchronize both before
+            # training and before passing limits to the vLLM rollout.
+            configure_qwen_image_pixels(
+                processing_class, kwargs.get("min_pixels"), kwargs.get("max_pixels")
+            )
         self.vlm_module.post_model_init(model, processing_class)
         self.vlm_module.post_model_init(self.ref_model, processing_class)
 
@@ -463,13 +426,22 @@ class VLMGRPOTrainer(Trainer):
         if args.max_prompt_length is not None:
             warnings.warn("Setting max_prompt_length is currently not supported, it has been set to None")
 
-        self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper
-        self.num_generations = args.num_generations  # = G in the GRPO paper
+        self.max_completion_length = args.max_completion_length
+        self.num_generations = args.num_generations
+        eos_token_id = getattr(getattr(model, "generation_config", None), "eos_token_id", None)
+        if eos_token_id is None:
+            eos_token_id = processing_class.eos_token_id
         self.generation_config = GenerationConfig(
             max_new_tokens=self.max_completion_length,
+            use_cache=True,
             do_sample=True,  
             temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k if args.top_k is not None else 0,
+            min_p=args.min_p,
+            repetition_penalty=args.repetition_penalty,
             pad_token_id=pad_token_id,
+            eos_token_id=eos_token_id,
         )
         self.dynamic_sampling = args.dynamic_sampling
         self.dynamic_sampling_std_threshold = args.dynamic_sampling_std_threshold
@@ -484,7 +456,7 @@ class VLMGRPOTrainer(Trainer):
         self.epsilon_high = args.epsilon_high if args.epsilon_high is not None else args.epsilon
 
         # Multi-step
-        self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper
+        self.num_iterations = args.num_iterations
         # Tracks the number of iterations (forward + backward passes), including those within a gradient accumulation cycle
         self._step = 0
         # Buffer the batch to reuse generated outputs across multiple updates
@@ -503,6 +475,14 @@ class VLMGRPOTrainer(Trainer):
         
         # Store script_args for later access
         self.script_args = script_args
+
+        eval_sources = list(eval_dataset.values()) if isinstance(eval_dataset, dict) else [eval_dataset]
+        if any(isinstance(dataset, IterableDataset) for dataset in [train_dataset, *eval_sources]):
+            if args.dataloader_num_workers:
+                raise ValueError("Iterable GRPO requires dataloader_num_workers=0 to preserve replay order")
+            if args.accelerator_config.dispatch_batches is True:
+                raise ValueError("Iterable GRPO prompt batches require dispatch_batches=False")
+            args.accelerator_config.dispatch_batches = False
         
         super().__init__(
             model=model,
@@ -540,28 +520,27 @@ class VLMGRPOTrainer(Trainer):
         # Check if using ZeRO Stage 3 for model parallel
         is_zero3_enabled = is_deepspeed_zero3_enabled()
         print(f"[DEBUG] ZeRO Stage 3 enabled: {is_zero3_enabled}")
-        # FSDP shards params just like ZeRO-3 (data-parallel + sharded), so the
-        # global-batch divisibility check should be skipped for it too.
+        # Parameter sharding does not change per-step reward grouping.
         is_fsdp_enabled = bool(getattr(self, "is_fsdp_enabled", False))
         print(f"[DEBUG] FSDP enabled: {is_fsdp_enabled}")
         is_sharded_enabled = is_zero3_enabled or is_fsdp_enabled
 
-        if not is_clevr_spotdiff and not is_sharded_enabled:
+        if not is_clevr_spotdiff:
             num_processes = self.accelerator.num_processes
-            global_batch_size = args.per_device_train_batch_size * num_processes
+            global_batch_size = args.train_batch_size * num_processes
             possible_values = [n_gen for n_gen in range(2, global_batch_size + 1) if (global_batch_size) % n_gen == 0]
             if self.num_generations not in possible_values:
                 raise ValueError(
-                    f"The global train batch size ({num_processes} x {args.per_device_train_batch_size}) must be evenly "
+                    f"The global train batch size ({num_processes} x {args.train_batch_size}) must be evenly "
                     f"divisible by the number of generations per prompt ({self.num_generations}). Given the current train "
                     f"batch size, the valid values for the number of generations are: {possible_values}."
                 )
             if self.args.eval_strategy != "no":
-                global_batch_size = args.per_device_eval_batch_size * num_processes
+                global_batch_size = args.eval_batch_size * num_processes
                 possible_values = [n_gen for n_gen in range(2, global_batch_size + 1) if (global_batch_size) % n_gen == 0]
                 if self.num_generations not in possible_values:
                     raise ValueError(
-                        f"The global eval batch size ({num_processes} x {args.per_device_eval_batch_size}) must be evenly "
+                        f"The global eval batch size ({num_processes} x {args.eval_batch_size}) must be evenly "
                         f"divisible by the number of generations per prompt ({self.num_generations}). Given the current "
                         f"eval batch size, the valid values for the number of generations are: {possible_values}."
                     )
@@ -574,13 +553,6 @@ class VLMGRPOTrainer(Trainer):
                     print(f"{_which} Model Parallel: {self.accelerator.num_processes} GPUs collaborating on each game")
                 else:
                     print(f"Data Parallel: {self.accelerator.num_processes} GPUs processing separate games")
-                print(f"Per-device batch size: {args.per_device_train_batch_size}")
-                print(f"Number of generations: {self.num_generations}")
-        elif is_sharded_enabled:
-            # For ZeRO Stage 3 / FSDP model parallel, skip batch size checks
-            if self.accelerator.process_index == 0:
-                _which = "ZeRO Stage 3" if is_zero3_enabled else "FSDP"
-                print(f"{_which} Model Parallel enabled: {self.accelerator.num_processes} GPUs collaborating")
                 print(f"Per-device batch size: {args.per_device_train_batch_size}")
                 print(f"Number of generations: {self.num_generations}")
 
@@ -619,11 +591,14 @@ class VLMGRPOTrainer(Trainer):
         if self._vllm_rollout is None:
             if self.is_fsdp_enabled and self.accelerator.state.fsdp_plugin.fsdp_version != 2:
                 raise ValueError("GRPO vLLM weight synchronization requires FSDP2, not FSDP1.")
-            image_processor = getattr(self.processing_class, "image_processor", None)
-            processor_kwargs = {
-                k: getattr(image_processor, k) for k in ("min_pixels", "max_pixels")
-                if getattr(image_processor, k, None) is not None
-            }
+            if self.vlm_module.get_vlm_key() == "qwen":
+                processor_kwargs = qwen_pixel_limits(self.processing_class)
+            else:
+                image_processor = getattr(self.processing_class, "image_processor", None)
+                processor_kwargs = {
+                    k: getattr(image_processor, k) for k in ("min_pixels", "max_pixels")
+                    if getattr(image_processor, k, None) is not None
+                }
             engine_kwargs = dict(
                 model=self._rollout_model_id,
                 dtype=self.args.vllm_dtype,
@@ -846,6 +821,32 @@ class VLMGRPOTrainer(Trainer):
         # Simple pass-through, just like original
         return inputs
 
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        with torch.no_grad(), self.compute_loss_context_manager():
+            loss = self.compute_loss(model, self._prepare_inputs(inputs))
+        return loss.detach().mean(), None, None
+
+    def evaluation_loop(self, dataloader, description, prediction_loss_only=None,
+                        ignore_keys=None, metric_key_prefix="eval"):
+        # Sampler rows already form complete groups; raw dataset length must not trim them.
+        gather = self.gather_function
+        self.gather_function = self.accelerator.gather
+        try:
+            return super().evaluation_loop(dataloader, description, prediction_loss_only,
+                                           ignore_keys, metric_key_prefix)
+        finally:
+            self.gather_function = gather
+
+    def _assert_finite_loss_inputs(self, *tensors):
+        bad = torch.zeros(1, device=self.accelerator.device)
+        for tensor in tensors:
+            if tensor is not None:
+                bad += (~torch.isfinite(tensor).all()).float()
+        if getattr(self.accelerator, "num_processes", 1) > 1:
+            bad = self.accelerator.reduce(bad, reduction="sum")
+        if bad.item():
+            raise FloatingPointError("Non-finite GRPO log probabilities, advantages, or loss; refusing unsafe backward")
+
     def _get_key_from_inputs(self, x, key):
         ele = x.get(key, None)
         assert ele is not None, f"The key {key} is not found in the input"
@@ -855,11 +856,7 @@ class VLMGRPOTrainer(Trainer):
             return [ele]
 
     def _generate_and_score_completions(self, inputs: dict[str, Union[torch.Tensor, Any]], model) -> dict[str, Union[torch.Tensor, Any]]:
-        """Generate a non-degenerate rollout batch with bounded DAPO-style resampling.
-
-        All ranks retry together so groups that span devices remain aligned.
-        The retry bound prevents a hard prompt from stalling training forever.
-        """
+        """Retry degenerate rollout batches with a shared limit across ranks."""
         # 'mask_degenerate' neutralises degenerate groups during scoring, so
         # there is nothing to resample for.
         resample = self.dynamic_sampling and self.dynamic_sampling_mode == "batch_retry"
@@ -921,7 +918,7 @@ class VLMGRPOTrainer(Trainer):
                         else:
                             new_h = 28
                             new_w = int(w * (28/h))
-                    img = img.resize((new_w, new_h), PIL.Image.Resampling.LANCZOS)
+                        img = img.resize((new_w, new_h), PIL.Image.Resampling.LANCZOS)
                 except:
                     pass
                 images.append(img)
@@ -989,6 +986,7 @@ class VLMGRPOTrainer(Trainer):
                 generate_returned_result = unwrapped_model.generate(
                     **{k: v for k, v in prompt_inputs.items() if k not in self.vlm_module.get_non_generate_params()},
                     generation_config=self.generation_config,
+                    use_cache=True,
                     logits_processor=self._rollout_logits_processor(),
                 )
                 prompt_length = prompt_ids.size(1)
@@ -1000,12 +998,12 @@ class VLMGRPOTrainer(Trainer):
                     completion_ids = generate_returned_result
                     prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
 
-        # Mask everything after the first EOS token
-        is_eos = completion_ids == self.processing_class.eos_token_id
-        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
-        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
-        sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
-        completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+        from .vllm_rollout import eos_completion_mask
+
+        eos_ids = getattr(self.generation_config, "eos_token_id", None)
+        if eos_ids is None:
+            eos_ids = self.processing_class.eos_token_id
+        completion_mask, hf_truncated = eos_completion_mask(completion_ids, eos_ids)
         if self.use_vllm:
             completion_mask = vllm_completion_mask
 
@@ -1086,8 +1084,7 @@ class VLMGRPOTrainer(Trainer):
         rewards = rewards_per_func.sum(dim=1)
         # Compute grouped-wise rewards
         # Each group consists of num_generations completions for the same prompt
-        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
-        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
+        mean_grouped_rewards, std_grouped_rewards = grouped_reward_stats(rewards, self.num_generations)
         
         # Normalize the rewards to compute the advantages
         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
@@ -1107,16 +1104,13 @@ class VLMGRPOTrainer(Trainer):
             )
         # A rollout cut off at max_completion_length has no </answer>, so its
         # near-zero reward reflects the length cap, not the reasoning.
-        truncated_local = vllm_truncated if self.use_vllm else ~is_eos.any(dim=1)
+        truncated_local = vllm_truncated if self.use_vllm else hf_truncated
         truncated = self.accelerator.gather(truncated_local.int()).bool()
         self._metrics["truncated_fraction"].append(truncated.float().mean().item())
         if self.overlong_filtering:
             advantages = advantages * (~truncated).float()
-        # Scrub non-finite advantages at the source: a reward function returning nan/inf
-        # (e.g. a judge timeout, a grounding divide-by-zero, a flaky live GPT-4o call) would
-        # otherwise propagate straight into per_token_loss -> grad_norm=nan -> poisoned weights
-        # -> next rollout crashes with "probability tensor contains inf/nan".
-        advantages = torch.nan_to_num(advantages, nan=0.0, posinf=0.0, neginf=0.0)
+        if not torch.isfinite(advantages).all():
+            raise FloatingPointError("Non-finite GRPO advantages after reward normalization")
 
         # Get only the local slice of advantages
         process_slice = slice(
@@ -1129,7 +1123,7 @@ class VLMGRPOTrainer(Trainer):
         completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
         self._metrics["completion_length"].append(completion_length)
 
-        reward_per_func = self.accelerator.gather_for_metrics(rewards_per_func).mean(0)
+        reward_per_func = rewards_per_func.mean(0)
         for i, reward_func in enumerate(self.reward_funcs):
             if isinstance(reward_func, PreTrainedModel):
                 reward_func_name = reward_func.config._name_or_path.split("/")[-1]
@@ -1137,7 +1131,7 @@ class VLMGRPOTrainer(Trainer):
                 reward_func_name = reward_func.__name__
             self._metrics[f"rewards/{reward_func_name}"].append(reward_per_func[i].item())
 
-        self._metrics["reward"].append(self.accelerator.gather_for_metrics(rewards).mean().item())
+        self._metrics["reward"].append(rewards.mean().item())
 
         # std_grouped_rewards is already global at this point; no second gather.
         self._metrics["reward_std"].append(std_grouped_rewards.mean().item())
@@ -1150,15 +1144,7 @@ class VLMGRPOTrainer(Trainer):
         try:
             from open_r1.self_evolve.live_reward import get_last_breakdowns
 
-            _bd = get_last_breakdowns() or []
-            if _bd:
-                for _dim in ("answer", "grounding", "process", "consistency", "budget"):
-                    _vals = [float(b.get(_dim, 0.0)) for b in _bd if isinstance(b, dict) and b.get(_dim) is not None]
-                    if not _vals:
-                        continue
-                    _local_mean = torch.tensor(sum(_vals) / len(_vals), device=device, dtype=torch.float32)
-                    _global_mean = self.accelerator.gather_for_metrics(_local_mean).mean().item()
-                    self._metrics[f"reward/{_dim}"].append(_global_mean)
+            self._log_reward_breakdown_metrics(get_last_breakdowns(), device)
         except Exception as _e:
             print(f"[REWARD-DIM-METRICS] skipped: {_e}")
 
@@ -1181,6 +1167,26 @@ class VLMGRPOTrainer(Trainer):
             "multimodal_inputs": multimodal_inputs,
             "_group_reward_stds": std_grouped_rewards[::self.num_generations].tolist(),
         }
+
+    def _log_reward_breakdown_metrics(self, breakdowns, device):
+        # Fixed-shape sums/counts support absent kinds and unequal kind counts across ranks.
+        local_stats = reward_breakdown_sums(breakdowns, device)
+        stats = self.accelerator.gather(local_stats.unsqueeze(0)).sum(dim=0)
+        for index, metric in enumerate(REWARD_BREAKDOWN_METRICS[:5]):
+            total, count = stats[0, index]
+            if count.item() > 0:
+                self._metrics[f"reward/{metric}"].append((total / count).item())
+        overall_count = stats[0, -1, 0]
+        for row, kind in enumerate(REWARD_TASK_KINDS, start=1):
+            kind_count = stats[row, -1, 0]
+            self._metrics[f"reward/{kind}/sample_count"].append(kind_count.item())
+            self._metrics[f"reward/{kind}/sample_fraction"].append(
+                (kind_count / overall_count.clamp(min=1.0)).item()
+            )
+            for index, metric in enumerate(REWARD_BREAKDOWN_METRICS[:-1]):
+                total, count = stats[row, index]
+                if count.item() > 0:
+                    self._metrics[f"reward/{kind}/{metric}"].append((total / count).item())
 
     def _maybe_dump_step_rollouts(self, prompts, completions, inputs, advantages):
         """Dump every rollout of this step (traj text + five-dim reward) to disk.
@@ -3489,6 +3495,11 @@ class VLMGRPOTrainer(Trainer):
         #     print(f"[DEBUG] is_clevr_spotdiff: {is_clevr_spotdiff}")
         
         if is_clevr_spotdiff:
+            if getattr(self, "loss_type", "grpo") == "dr_grpo":
+                raise ValueError(
+                    "dr_grpo fixed-batch reduction requires the self_evolve_refined_grpo task path. "
+                    "The legacy two-phase clevr_spotdiff path selects a variable number of phase rows."
+                )
             if self.use_vllm:
                 raise ValueError(
                     "The legacy two-phase clevr_spotdiff trainer requires use_vllm=False. "
@@ -3502,14 +3513,18 @@ class VLMGRPOTrainer(Trainer):
             # Standard GRPO training
             # if self.accelerator.process_index == 0:
             #     print(f"[DEBUG] Standard GRPO training, num_generations: {self.num_generations}")
-            print(self.num_generations)
-            if self.state.global_step % self.num_iterations == 0:
+            evaluating = not getattr(model, "training", True)
+            if evaluating:
+                processed_inputs = self._generate_and_score_completions(actual_inputs, model)
+            elif (self.state.global_step % self.num_iterations == 0
+                  or self._buffered_inputs[self._step % self.args.gradient_accumulation_steps] is None):
                 processed_inputs = self._generate_and_score_completions(actual_inputs, model)
                 self._buffered_inputs[self._step % self.args.gradient_accumulation_steps] = processed_inputs
             else:
                 processed_inputs = self._buffered_inputs[self._step % self.args.gradient_accumulation_steps]
         
-        self._step += 1
+        if getattr(model, "training", True):
+            self._step += 1
 
         # Check if this is CLEVR group-based training
         if "game_rewards" in processed_inputs:
@@ -3655,12 +3670,12 @@ class VLMGRPOTrainer(Trainer):
                 # if self.accelerator.process_index == 0:
                 #     print("[DEBUG] Using fallback: current logps as old_per_token_logps")
 
-            # Compute the policy ratio and clipped version.
-            # Clamp the log-ratio BEFORE exp() (verl-style). This is the root-cause guard for the
-            # intermittent grad_norm=nan: an uncapped exp() can overflow to inf on extreme tokens
-            # (bf16 rollout vs. recompute numerical mismatch), and backward through an inf node
-            # yields inf/nan gradients regardless of any downstream nan_to_num on the loss *value*.
-            # clamp(-10, 10) bounds coef_1 to [e^-10, e^10] and zeroes the gradient outside the range.
+            ref_per_token_logps = processed_inputs.get("ref_per_token_logps") if self.beta > 0 else None
+            if ref_per_token_logps is not None:
+                ref_per_token_logps = ref_per_token_logps[training_mask]
+            self._assert_finite_loss_inputs(per_token_logps, old_per_token_logps, advantages, ref_per_token_logps)
+
+            # Bound log ratios before exponentiation to keep gradients finite.
             log_ratio = (per_token_logps - old_per_token_logps).clamp(-10, 10)
             coef_1 = torch.exp(log_ratio)
             coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
@@ -3670,9 +3685,7 @@ class VLMGRPOTrainer(Trainer):
 
             # Add KL penalty if beta > 0 and ref_per_token_logps available
             if self.beta > 0:
-                ref_per_token_logps = processed_inputs.get("ref_per_token_logps")
                 if ref_per_token_logps is not None:
-                    ref_per_token_logps = ref_per_token_logps[training_mask]
                     # Clamp exponent to keep the k3 KL term finite (see standard-GRPO path).
                     delta = (ref_per_token_logps - per_token_logps).clamp(-20, 20)
                     per_token_kl = torch.exp(delta) - delta - 1
@@ -3686,9 +3699,12 @@ class VLMGRPOTrainer(Trainer):
                     # No reference model logps available
                     self._metrics["kl"].append(0.0)
 
-            # Compute final loss. nan_to_num + clamp mirror the standard-GRPO path guards.
-            per_token_loss = torch.nan_to_num(per_token_loss, nan=0.0, posinf=0.0, neginf=0.0)
-            loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1).clamp(min=1.0)).mean()
+            loss = reduce_grpo_loss(
+                per_token_loss, completion_mask,
+                getattr(self, "loss_type", "grpo"), self.max_completion_length,
+                getattr(self, "loss_normalization_length", None),
+            )
+            self._assert_finite_loss_inputs(per_token_loss, loss)
 
             # Log clip ratio
             is_clipped = (per_token_loss1 < per_token_loss2).float()
@@ -3736,11 +3752,10 @@ class VLMGRPOTrainer(Trainer):
             # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip its computation
             # and use per_token_logps.detach() instead
             old_per_token_logps = processed_inputs["old_per_token_logps"] if self.num_iterations > 1 else per_token_logps.detach()
+            ref_per_token_logps = processed_inputs["ref_per_token_logps"] if self.beta > 0 else None
+            self._assert_finite_loss_inputs(per_token_logps, old_per_token_logps, advantages, ref_per_token_logps)
 
-            # Compute the policy ratio and clipped version.
-            # Clamp the log-ratio BEFORE exp() (verl-style) — see the matching guard in the other
-            # loss branch above for the full rationale. Bounds coef_1 to [e^-10, e^10] so an extreme
-            # token cannot push exp() to inf and poison the backward graph with inf/nan gradients.
+            # Bound log ratios before exponentiation to keep gradients finite.
             log_ratio = (per_token_logps - old_per_token_logps).clamp(-10, 10)
             coef_1 = torch.exp(log_ratio)
             coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
@@ -3750,7 +3765,6 @@ class VLMGRPOTrainer(Trainer):
 
             # Add KL penalty if beta > 0
             if self.beta > 0:
-                ref_per_token_logps = processed_inputs["ref_per_token_logps"]
                 # k3 KL estimator goes into the loss (not just logging), so its bare exp() is a
                 # live nan/inf source: when policy logp << ref logp, (ref - policy) is large and
                 # exp() overflows to inf -> loss=inf -> grad_norm=nan. Clamp the exponent to keep
@@ -3764,35 +3778,17 @@ class VLMGRPOTrainer(Trainer):
                 mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1).clamp(min=1.0)).mean()
                 self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
 
-            # Compute final loss. Two guards against the intermittent grad_norm=nan that then
-            # poisons the weights and crashes the next rollout with "probability tensor contains
-            # inf/nan": (1) nan_to_num scrubs any non-finite per-token loss so one bad sample
-            # cannot poison the whole batch; (2) clamp(min=1.0) on the per-sequence token count
-            # avoids the 0/0 when a completion is empty / fully masked.
-            per_token_loss = torch.nan_to_num(per_token_loss, nan=0.0, posinf=0.0, neginf=0.0)
-            loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1).clamp(min=1.0)).mean()
+            loss = reduce_grpo_loss(
+                per_token_loss, completion_mask,
+                getattr(self, "loss_type", "grpo"), self.max_completion_length,
+                getattr(self, "loss_normalization_length", None),
+            )
+            self._assert_finite_loss_inputs(per_token_loss, loss)
 
             # Log clip ratio
             is_clipped = (per_token_loss1 < per_token_loss2).float()
             clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
             self._metrics["clip_ratio"].append(self.accelerator.gather_for_metrics(clip_ratio).mean().item())
-
-        # A-2 grad-finite gate (verl-style skip). Under DeepSpeed ZeRO-3 the optimizer step runs
-        # *inside* accelerator.backward(), so HF's post-backward grad-norm hook is too late to skip.
-        # The correct interception is here, on the loss that feeds backward: if it is non-finite,
-        # detach the poisoned graph and return a fresh leaf zero-tensor (identical to the "no samples"
-        # skip at the top of this method). backward then produces finite zero-gradients -> the engine
-        # step is a no-op, so a stray nan never reaches the weights (which is what crashes the next
-        # rollout). Each rank checks its own scalar with identical control flow, so ZeRO-3 collectives
-        # stay in lock-step and cannot hang. A-1's log-ratio clamp already keeps the graph finite, so
-        # this is the last-resort net and should rarely fire.
-        if loss is not None and not torch.isfinite(loss):
-            if self.accelerator.is_main_process:
-                print(
-                    f"[GRAD-SKIP] step={self.state.global_step} non-finite loss={loss.item()} "
-                    f"-> skipping update (returning zero loss)"
-                )
-            return torch.tensor(0.0, device=self.accelerator.device, requires_grad=True)
 
         return loss
 
@@ -3811,17 +3807,7 @@ class VLMGRPOTrainer(Trainer):
         dataset_name: Optional[str] = None,
         tags: Union[str, list[str], None] = None,
     ):
-        """
-        Creates a draft of a model card using the information available to the `Trainer`.
-
-        Args:
-            model_name (`str` or `None`, *optional*, defaults to `None`):
-                Name of the model.
-            dataset_name (`str` or `None`, *optional*, defaults to `None`):
-                Name of the dataset used for training.
-            tags (`str`, `list[str]` or `None`, *optional*, defaults to `None`):
-                Tags to be associated with the model card.
-        """
+        """Save a draft model card from the trainer's model and dataset metadata."""
         if not self.is_world_process_zero():
             return
 
@@ -3837,16 +3823,6 @@ class VLMGRPOTrainer(Trainer):
         if hasattr(self.model.config, "unsloth_version"):
             tags.append("unsloth")
 
-        citation = textwrap.dedent(
-            """\
-            @article{zhihong2024deepseekmath,
-                title        = {{DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models}},
-                author       = {Zhihong Shao and Peiyi Wang and Qihao Zhu and Runxin Xu and Junxiao Song and Mingchuan Zhang and Y. K. Li and Y. Wu and Daya Guo},
-                year         = 2024,
-                eprint       = {arXiv:2402.03300},
-            """
-        )
-
         model_card = generate_model_card(
             base_model=base_model,
             model_name=model_name,
@@ -3856,28 +3832,26 @@ class VLMGRPOTrainer(Trainer):
             wandb_url=wandb.run.get_url() if is_wandb_available() and wandb.run is not None else None,
             comet_url=get_comet_experiment_url(),
             trainer_name="GRPO",
-            trainer_citation=citation,
-            paper_title="DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models",
-            paper_id="2402.03300",
         )
 
         model_card.save(os.path.join(self.args.output_dir, "README.md"))
 
-    def _get_train_sampler(self) -> Optional[Sampler]:
+    def _get_train_sampler(self, train_dataset=None) -> Optional[Sampler]:
         """Returns a sampler that ensures proper data sampling for GRPO training."""
+        train_dataset = self.train_dataset if train_dataset is None else train_dataset
         # For IterableDataset, we don't need a sampler
-        if isinstance(self.train_dataset, (IterableDataset, DynamicIterableDataset, EpochAwareIterableDataset, CyclicDynamicDataset)):
+        if isinstance(train_dataset, IterableDataset):
             return None
             
         effective_batch_size = (
-            self.args.per_device_train_batch_size
+            self.args.train_batch_size
             * self.accelerator.num_processes
             * self.args.gradient_accumulation_steps
         )
         
         # Use CyclicRepeatSampler to ensure same samples within num_iterations cycle
         return CyclicRepeatSampler(
-            data_source=self.train_dataset,
+            data_source=train_dataset,
             mini_repeat_count=self.num_generations,
             batch_size=effective_batch_size // self.num_generations,
             cycle_length=self.num_iterations,
@@ -3891,7 +3865,7 @@ class VLMGRPOTrainer(Trainer):
             return None
         
         effective_batch_size = (
-            self.args.per_device_eval_batch_size
+            self.args.eval_batch_size
             * self.accelerator.num_processes
         )
         
@@ -3927,74 +3901,3 @@ class VLMGRPOTrainer(Trainer):
             dataloader.set_epoch = set_epoch
         
         return dataloader
-
-    def _save_checkpoint(self, model, trial, metrics=None):
-        """Override to add S3 sync after each checkpoint save"""
-        # Call parent class save method
-        result = super()._save_checkpoint(model, trial)
-        
-        # Execute S3 sync command after successful checkpoint save
-        try:
-            import subprocess
-            sync_command = [
-                "aws", "s3", "sync", 
-                "/mnt/localssd/output", 
-                "s3://qinsiwang/0814-InternVL-Interactive-now"
-            ]
-            
-            if self.accelerator.process_index == 0:  # Only sync from main process
-                print(f"[S3 SYNC] Starting sync to S3...")
-                result_sync = subprocess.run(
-                    sync_command, 
-                    check=True, 
-                    capture_output=True, 
-                    text=True
-                )
-                print(f"[S3 SYNC] ✅ Successfully synced checkpoint to S3")
-                print(f"[S3 SYNC] Output: {result_sync.stdout}")
-                
-        except subprocess.CalledProcessError as e:
-            print(f"[S3 SYNC] ❌ Failed to sync to S3: {e}")
-            print(f"[S3 SYNC] Error output: {e.stderr}")
-        except FileNotFoundError:
-            print(f"[S3 SYNC] ❌ AWS CLI not found. Please install AWS CLI to enable S3 sync.")
-        except Exception as e:
-            print(f"[S3 SYNC] ❌ Unexpected error during S3 sync: {e}")
-        
-        return result
-    
-    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
-        """Override to add S3 sync after final model save"""
-        # Call parent class save method
-        result = super().save_model(output_dir, _internal_call)
-        
-        # Execute S3 sync command after final model save
-        if not _internal_call:  # Only sync for final save, not internal checkpoint saves
-            try:
-                import subprocess
-                sync_command = [
-                    "aws", "s3", "sync", 
-                    "/mnt/localssd/output", 
-                    "s3://qinsiwang/0814-InternVL-Interactive-now"
-                ]
-                
-                if self.accelerator.process_index == 0:  # Only sync from main process
-                    print(f"[S3 SYNC] Starting final model sync to S3...")
-                    result_sync = subprocess.run(
-                        sync_command, 
-                        check=True, 
-                        capture_output=True, 
-                        text=True
-                    )
-                    print(f"[S3 SYNC] ✅ Successfully synced final model to S3")
-                    print(f"[S3 SYNC] Output: {result_sync.stdout}")
-                    
-            except subprocess.CalledProcessError as e:
-                print(f"[S3 SYNC] ❌ Failed to sync final model to S3: {e}")
-                print(f"[S3 SYNC] Error output: {e.stderr}")
-            except FileNotFoundError:
-                print(f"[S3 SYNC] ❌ AWS CLI not found. Please install AWS CLI to enable S3 sync.")
-            except Exception as e:
-                print(f"[S3 SYNC] ❌ Unexpected error during final model S3 sync: {e}")
-        
-        return result

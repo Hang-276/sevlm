@@ -20,31 +20,29 @@ set -euo pipefail
 # REPO = sevlm 仓库根（从本脚本位置推导：experiments/ 向上三级）。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REPO:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
-WORKSPACE="${WORKSPACE:-/jizhicfs/rtliu}"
+WORKSPACE="${WORKSPACE:-$REPO}"
 
-# --- conda 环境（GPU 机上使用 sevlm）---
-# flash-attn 2.7.4.post1 已从官方 wheel 装进该 env（详见第 3 节 ATTN_IMPL）。
-CONDA_BASE="${CONDA_BASE:-/jizhicfs/rtliu/miniconda3}"
-CONDA_ENV="${CONDA_ENV:-sevlm}"
+# --- 已有 conda 环境 ---
+CONDA_BASE="${CONDA_BASE:-}"
+CONDA_ENV="${CONDA_ENV:-easy-r1}"
 WANDB_PKG_DIR="${WANDB_PKG_DIR:-/tmp/sevlm_wandb_py311}"
-if [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
+if [ -n "$CONDA_BASE" ] && [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
   # shellcheck disable=SC1091
   source "$CONDA_BASE/etc/profile.d/conda.sh"
   conda activate "$CONDA_ENV"
-else
+elif [ -n "$CONDA_BASE" ]; then
   echo "[WARN] conda.sh not found at $CONDA_BASE (set CONDA_BASE if conda lives elsewhere)" >&2
 fi
-# --- python 解释器（找不到 conda env 就回退到 PATH 上的 python，并告警）---
-PY="${PY:-$CONDA_BASE/envs/$CONDA_ENV/bin/python}"
+# --- 使用 PY 或当前环境的 Python ---
+PY="${PY:-$(command -v python3 || command -v python || true)}"
 if [ ! -x "$PY" ]; then
   PY="$(command -v python3 || command -v python || true)"
   [ -n "$PY" ] || { echo "[ERROR] no python found. Set PY=/path/to/python, or CONDA_BASE/CONDA_ENV." >&2; exit 2; }
-  echo "[WARN] conda env '$CONDA_ENV' not found; using $PY." >&2
+  echo "[WARN] requested Python is unavailable; using $PY." >&2
 fi
 
 DATASET_ROOT="${DATASET_ROOT:-$WORKSPACE/data/Vision-Zero-clevr-dataset}"
 BASE_MODEL="${BASE_MODEL:-$WORKSPACE/models/Qwen2.5-VL-7B-Instruct}"
-# BASE_MODEL="${BASE_MODEL:-$WORKSPACE/self_evolve_runs/ours_0824_newcode_iter1/iter_000/checkpoints/grpo_qwen2_5_vl/checkpoint-90}"
 RUNS_ROOT="${RUNS_ROOT:-$WORKSPACE/self_evolve_runs}"
 
 export PYTHONPATH="$REPO/src:${PYTHONPATH:-}"
@@ -64,15 +62,13 @@ REFERENCE_VLM_MODEL="${REFERENCE_VLM_MODEL:-deepseek-flash}"
 REFERENCE_PROVIDER="${REFERENCE_PROVIDER:-openai}"
 
 # ---- Answer judge：GRPO 打分时兜 exact-match 的语义等价判断，纯文本、无图 ----
-# 必须带 /v1：OpenAI SDK 只往 base_url 后面拼 /chat/completions，
-# 少了 /v1 会打到 https://api.poixe.com/chat/completions → 404。
-ANSWER_JUDGE_BASE_URL="${ANSWER_JUDGE_BASE_URL:-https://api.poixe.com/v1}"
+# OpenAI 兼容接口需包含 /v1。
+ANSWER_JUDGE_BASE_URL="${ANSWER_JUDGE_BASE_URL:-https://api.openai.com/v1}"
 ANSWER_JUDGE_API_KEY="${ANSWER_JUDGE_API_KEY:-}"
 ANSWER_JUDGE_MODEL="${ANSWER_JUDGE_MODEL:-gpt-4o-mini}"
 
 # ---- wandb ----
-# 和 grpo_baseline_train.sh:187 是同一把 key；轮换时两个文件都要改。
-WANDB_API_KEY="${WANDB_API_KEY:-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}"
+WANDB_API_KEY="${WANDB_API_KEY:-}"
 
 # 这些要给 loop / trainer 子进程读，必须 export。
 export REFERENCE_VLM_BASE_URL REFERENCE_VLM_API_KEY REFERENCE_VLM_MODEL \
@@ -101,9 +97,7 @@ GRAD_ACCUM="${GRAD_ACCUM:-16}"
 TRAINER_BACKEND="${TRAINER_BACKEND:-deepspeed}"
 
 # ---- attention 实现（两个 trainer 都透传 --attn_implementation）----
-# flash-attn 2.7.4.post1（官方 wheel，torch2.6+cu124/cp311）已装在 sevlm env，
-# wheel 存 /jizhicfs/rtliu/wheels/。注意：装了包不等于启用 —— transformers 只在
-# 显式传 flag 时才用 FA2，否则仍解析成 sdpa。回退 sdpa 只需 ATTN_IMPL=sdpa。
+# 需安装 flash-attn；可通过 ATTN_IMPL=sdpa 切换。
 ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
 
 # ← 完整方法用默认 reward（五维加权）。
@@ -128,7 +122,7 @@ GRPO_MAX_COMPLETION_LEN="${GRPO_MAX_COMPLETION_LEN:-2048}"  # 库默认 256 放�
 # 分辨率对齐 baseline 的 GRPO_MIN/MAX_PIXELS
 GRPO_MIN_PIXELS="${GRPO_MIN_PIXELS:-602112}"            # 768*28*28
 GRPO_MAX_PIXELS="${GRPO_MAX_PIXELS:-1003520}"           # 1280*28*28（CLEVR 物体在此分辨率仍可辨）
-GRPO_SCALE_REWARDS="${GRPO_SCALE_REWARDS:-False}"        # Dr.GRPO：减组均值但不除 std
+GRPO_SCALE_REWARDS="${GRPO_SCALE_REWARDS:-False}"        # 减组均值，不除标准差
 GRPO_OVERLONG_FILTERING="${GRPO_OVERLONG_FILTERING:-True}"  # 被 max_completion_length 截断（无 EOS）的 rollout 给 0 advantage
 GRPO_DYNAMIC_SAMPLING="${GRPO_DYNAMIC_SAMPLING:-True}"
 GRPO_DYNAMIC_MODE="${GRPO_DYNAMIC_MODE:-mask_degenerate}"   # 只把退化组 advantage 置 0，保留健康组

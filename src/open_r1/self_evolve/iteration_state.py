@@ -166,6 +166,8 @@ def update_generator_policy(
     solvability = dict(failure_profile.get("solvability") or {})
     solve_rate = solvability.get("mean_solve_rate")
     solve_rate = float(solve_rate) if solve_rate is not None else None
+    verified_rate = solvability.get("mean_verified_pass_rate")
+    verified_rate = float(verified_rate) if verified_rate is not None else None
 
     # Only an EXPLICIT reduce signal counts as "suggests easier". Target echoes
     # are ignored here on purpose.
@@ -193,8 +195,23 @@ def update_generator_policy(
             )
     # Priority 2: steer toward the learnable frontier, not toward "as hard as
     # possible" — group spread, and so the gradient, peaks near a 0.5 solve rate.
+    elif solvability.get("num_certified_tasks") == 0:
+        distribution = {k: round(float(prev_dist.get(k, _DIFFICULTY_BALANCED[k])), 4)
+                        for k in ("easy", "medium", "hard")}
+        difficulty_target = (prev.get("difficulty_policy", {}) or {}).get(
+            "difficulty_target", "medium"
+        )
+        reasons.append("hold_difficulty_until_visual_certificate_available")
     elif solve_rate is not None:
-        if solve_rate > LEARNABILITY_BAND[1]:
+        if (solve_rate > LEARNABILITY_BAND[1] and verified_rate is not None
+                and verified_rate <= LEARNABILITY_BAND[1]):
+            distribution = {k: round(float(prev_dist.get(k, _DIFFICULTY_BALANCED[k])), 4)
+                            for k in ("easy", "medium", "hard")}
+            difficulty_target = (prev.get("difficulty_policy", {}) or {}).get(
+                "difficulty_target", "medium"
+            )
+            reasons.append(f"hold_difficulty_until_visual_evidence_mastered({verified_rate:.2f})")
+        elif solve_rate > LEARNABILITY_BAND[1]:
             distribution = _shift_distribution_harder(prev_dist)
             difficulty_target = "hard"
             reasons.append(f"increase_difficulty_solve_rate_above_band({solve_rate:.2f})")
@@ -211,11 +228,11 @@ def update_generator_policy(
             reasons.append(f"hold_difficulty_solve_rate_in_band({solve_rate:.2f})")
     # Priority 3: no solvability signal yet, fall back to the reward means.
     # Grounding/process weakness only raises the focus weights, never difficulty.
-    elif answer >= 0.8:
+    elif "answer" in reward_means and answer >= 0.8:
         distribution = _shift_distribution_harder(prev_dist)
         difficulty_target = "hard"
         reasons.append("increase_hard_due_to_strong_answer_accuracy")
-    elif answer <= 0.2:
+    elif "answer" in reward_means and answer <= 0.2:
         distribution = _shift_distribution_easier(prev_dist)
         difficulty_target = "medium"
         reasons.append("reduce_difficulty_due_to_low_answer_accuracy")
@@ -257,6 +274,7 @@ def update_generator_policy(
     has_feedback = bool(
         tag_counts or reward_means or reject_counts or suggested_hist_all
         or reduce_difficulty_count or strict_easier_count or too_difficult_count
+        or solve_rate is not None or verified_rate is not None
     )
     if not has_feedback:
         reasons = ["no_feedback_keep_previous_or_minimal_decay"]
@@ -274,6 +292,9 @@ def update_generator_policy(
         "sampling_policy": {"focus_weights": focus_weights},
         "solvability_feedback": {
             "mean_solve_rate": solve_rate,
+            "mean_verified_pass_rate": verified_rate,
+            "num_certified_tasks": solvability.get("num_certified_tasks"),
+            "frontier_counts": solvability.get("frontier_counts", {}),
             "mean_regret": solvability.get("mean_regret"),
             "advantage_collapse_rate": solvability.get("advantage_collapse_rate"),
             "learnability_band": list(LEARNABILITY_BAND),

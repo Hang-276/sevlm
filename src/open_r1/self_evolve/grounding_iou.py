@@ -6,21 +6,24 @@ Parses the boxes a solver emits, matches them against the gold evidence boxes
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
 
-# Two syntaxes are accepted: <bbox player="1">[x1,y1,x2,y2]</bbox> and
-# Qwen2.5-VL's native {"bbox_2d": [...]}. ``coordinate_mode`` picks normalized
-# vs absolute pixels.
-
-_BBOX_RE = re.compile(
-    r"<bbox(?P<attrs>[^>]*)>\s*\[?\s*"
-    r"(?P<x1>-?\d*\.?\d+)\s*,\s*(?P<y1>-?\d*\.?\d+)\s*,\s*"
-    r"(?P<x2>-?\d*\.?\d+)\s*,\s*(?P<y2>-?\d*\.?\d+)\s*\]?\s*</bbox>",
-    re.IGNORECASE | re.DOTALL,
+# Accepted XML spellings include body coordinates, explicit x1/y1/x2/y2,
+# coords/bbox2d attributes, and the common x1="x1,y1,x2,y2" generation error.
+# The alt attribute is never interpreted as evidence: it often contains copied
+# examples or natural-language labels. Every explicit coordinate source in one
+# tag must agree, so the parser cannot cherry-pick a convenient box.
+_BBOX_TAG_RE = re.compile(r"<bbox(?=[\s>])(?P<attrs>[^>]*)>(?P<body>.*?)</bbox>", re.I | re.S)
+_BBOX_OPEN_RE = re.compile(r"<bbox(?=[\s>])[^>]*>", re.I | re.S)
+_ATTR_RE = re.compile(
+    r"\s+(?P<name>[a-zA-Z_][\w-]*)\s*=\s*"
+    r"(?:\"(?P<double>[^\"]*)\"|'(?P<single>[^']*)'|(?P<bare>[^\s\"'>]+))",
+    re.S,
 )
-_PLAYER_ATTR_RE = re.compile(r"player\s*=\s*[\"']?([^\"'>\s]+)[\"']?", re.IGNORECASE)
+_NUMBER_RE = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\Z")
 
 # Qwen2.5-VL's native syntax, in absolute pixels — a format the solver was
 # pretrained on rather than one it has to learn from a single example.
@@ -30,7 +33,99 @@ _BBOX_2D_RE = re.compile(
     r"(?P<x2>-?\d*\.?\d+)\s*,\s*(?P<y2>-?\d*\.?\d+)\s*\][^{}]*?)\}",
     re.IGNORECASE | re.DOTALL,
 )
-_PLAYER_JSON_RE = re.compile(r"\"player\"\s*:\s*\"?(\d+)\"?", re.IGNORECASE)
+_PLAYER_JSON_RE = re.compile(
+    r'"player"\s*:\s*(?:"([^\"]*)"|([^,}\s]+))(?=\s*(?:[,}]|$))', re.IGNORECASE
+)
+_PLAYER_JSON_KEY_RE = re.compile(r"\"player\"\s*:", re.IGNORECASE)
+_BBOX_JSON_KEY_RE = re.compile(r"\"bbox_2d\"\s*:", re.IGNORECASE)
+
+
+def _player_id(value: Optional[str]) -> Optional[int]:
+    if not value or len(value) > 10 or not value.isascii() or not value.isdecimal():
+        return None
+    player = int(value)
+    return player if 1 <= player <= 8 else None
+
+
+def _allowed_players(values: Optional[List[int]]) -> Optional[set[int]]:
+    if values is None:
+        return None
+    if not isinstance(values, (list, tuple)) or any(type(value) is not int or not 1 <= value <= 8
+                                                  for value in values):
+        return set()
+    return set(values)
+
+
+def _coordinate_tuple(value: str) -> Optional[List[float]]:
+    value = value.strip()
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    elif value.startswith("[") or value.endswith("]"):
+        return None
+    parts = [part.strip() for part in value.split(",")]
+    if len(parts) != 4 or any(not _NUMBER_RE.fullmatch(part) for part in parts):
+        return None
+    coords = [float(part) for part in parts]
+    return coords if all(math.isfinite(coord) for coord in coords) else None
+
+
+def _parse_bbox_tag(attrs: str, body: str) -> Tuple[Optional[List[float]], Optional[str], Optional[str]]:
+    if attrs.rstrip().endswith("/"):
+        return None, None, "self_closing_bbox"
+    parsed_attrs: Dict[str, List[str]] = {}
+    offset = 0
+    while offset < len(attrs):
+        if not attrs[offset:].strip():
+            break
+        match = _ATTR_RE.match(attrs, offset)
+        if match is None:
+            return None, None, "malformed_attributes"
+        name = match.group("name").lower()
+        parsed_attrs.setdefault(name, []).append(
+            next(v for v in (match.group("double"), match.group("single"), match.group("bare")) if v is not None)
+        )
+        offset = match.end()
+    players = parsed_attrs.get("player", [])
+    if len(players) > 1:
+        return None, None, "conflicting_player_ids"
+    player = players[0] if players else None
+
+    candidates: List[List[float]] = []
+    body_coords = _coordinate_tuple(body)
+    if body_coords is not None:
+        candidates.append(body_coords)
+    elif body.strip().startswith("[") and body.count(",") >= 3:
+        return None, player, "malformed_coords"
+
+    for name in ("coords", "bbox2d", "bbox_2d", "bbox-2d"):
+        for value in parsed_attrs.get(name, []):
+            coords = _coordinate_tuple(value)
+            if coords is None:
+                return None, player, "malformed_coords"
+            candidates.append(coords)
+
+    xyxy = [parsed_attrs.get(name, []) for name in ("x1", "y1", "x2", "y2")]
+    if any(xyxy):
+        if any(len(values) > 1 for values in xyxy):
+            return None, player, "conflicting_coords"
+        if all(xyxy):
+            values = [value[0] for value in xyxy]
+            if any(not _NUMBER_RE.fullmatch(value.strip()) for value in values):
+                return None, player, "malformed_coords"
+            candidates.append([float(value) for value in values])
+        elif xyxy[0] and not any(xyxy[1:]):
+            coords = _coordinate_tuple(xyxy[0][0])
+            if coords is None:
+                return None, player, "incomplete_coords"
+            candidates.append(coords)
+        else:
+            return None, player, "incomplete_coords"
+
+    if not candidates:
+        return None, player, "missing_coords"
+    if any(any(abs(a - b) > 1e-6 for a, b in zip(candidates[0], candidate)) for candidate in candidates[1:]):
+        return None, player, "conflicting_coords"
+    return candidates[0], player, None
 
 
 def _resolve_coordinate_scale(
@@ -65,8 +160,9 @@ def parse_evidence_boxes(
 
     ``coordinate_mode`` selects how the numbers are read: ``normalized`` ([0,1]),
     ``pixel`` (absolute, Qwen2.5-VL's native convention) or ``auto``.
-    ``valid_player_ids`` restricts the accepted player id; a bad id loses the
-    player-id credit but keeps the box's IoU signal.
+    ``valid_player_ids`` identifies the intended image. The legacy scorer can
+    still use a box with the wrong id for coordinate learning; strict reward
+    configs require every valid box to name the single gold player for IoU.
 
     Returns boxes_normalized / boxes_pixel / players / first_player /
     num_found / num_valid / bbox_valid / bbox_parse_error / errors.
@@ -86,37 +182,53 @@ def parse_evidence_boxes(
         out["bbox_parse_error"] = "no_completion"
         return out
 
-    # (match, raw_player_string|None, is_json)
-    matches: List[Tuple[Any, Optional[str], bool]] = [
-        (m, (_PLAYER_ATTR_RE.search(m.group("attrs") or "") or [None, None])[1]
-            if _PLAYER_ATTR_RE.search(m.group("attrs") or "") else None, False)
-        for m in _BBOX_RE.finditer(completion)
-    ]
+    # (position, raw coordinates, player, native JSON, parse error)
+    matches: List[Tuple[int, Optional[List[float]], Optional[str], bool, Optional[str]]] = []
+    tags = list(_BBOX_TAG_RE.finditer(completion))
+    for match in tags:
+        coords, player, error = _parse_bbox_tag(match.group("attrs"), match.group("body"))
+        matches.append((match.start(), coords, player, False, error))
     for m in _BBOX_2D_RE.finditer(completion):
-        pm = _PLAYER_JSON_RE.search(m.group("obj") or "")
-        matches.append((m, pm.group(1) if pm else None, True))
+        raw_obj = m.group("obj") or ""
+        pm = _PLAYER_JSON_RE.search(raw_obj)
+        coords = [float(m.group(k)) for k in ("x1", "y1", "x2", "y2")]
+        # Duplicate keys are ambiguous and a normal JSON loader keeps the
+        # last value. Never reward a convenient first player or bbox key.
+        parse_error = (
+            "conflicting_player_ids" if len(_PLAYER_JSON_KEY_RE.findall(raw_obj)) > 1
+            else "conflicting_coords" if len(_BBOX_JSON_KEY_RE.findall(raw_obj)) > 1
+            else None
+        )
+        player = next((value for value in pm.groups() if value is not None), None) if pm else None
+        matches.append((m.start(), coords, player, True, parse_error))
+    # A malformed/unclosed bbox still counts as an attempted prediction. This
+    # prevents an offline external-score fallback from paying for a bad tag.
+    dangling = max(0, len(_BBOX_OPEN_RE.findall(completion)) - len(tags))
+    matches.extend((len(completion), None, None, False, "unclosed_bbox") for _ in range(dangling))
+    matches.sort(key=lambda item: item[0])
 
     out["num_found"] = len(matches)
     if not matches:
         out["bbox_parse_error"] = "no_bbox_tag"
         return out
 
-    valid_set = set(int(p) for p in valid_player_ids) if valid_player_ids else None
+    valid_set = _allowed_players(valid_player_ids)
+    if valid_set == set():
+        out["bbox_parse_error"] = "invalid_player_metadata"
+        out["errors"] = ["invalid_player_metadata"]
+        return out
 
     errors: List[str] = []
     first_player_recorded = False
-    for m, raw_player, is_json in matches:
+    for _, raw_coords, raw_player, is_json, parse_error in matches:
         # Record the FIRST tag's raw player id for audit, even if the box is
         # later rejected (so player_N placeholders are still observable).
         if not first_player_recorded:
             first_player_recorded = True
-            if raw_player and raw_player.isdigit():
-                out["first_player"] = int(raw_player)
+            out["first_player"] = _player_id(raw_player)
 
-        try:
-            raw_coords = [float(m.group(k)) for k in ("x1", "y1", "x2", "y2")]
-        except (TypeError, ValueError):
-            errors.append("non_numeric_coords")
+        if parse_error is not None or raw_coords is None:
+            errors.append(parse_error or "non_numeric_coords")
             continue
         coords = _resolve_coordinate_scale(
             raw_coords, coordinate_mode, image_width, image_height, is_json
@@ -128,13 +240,14 @@ def parse_evidence_boxes(
         if not (x1 < x2 and y1 < y2):
             errors.append("bad_ordering")
             continue
-        # A wrong player id loses the player-id credit but keeps the box's IoU.
+        # Keep a well-formed box for audit even if its player id is wrong. The
+        # scorer decides whether strict mode zeroes its IoU contribution.
         player_val = None
         if raw_player is not None:
-            if not raw_player.isdigit():
+            player_val = _player_id(raw_player)
+            if player_val is None:
                 errors.append("invalid_player_id")
             else:
-                player_val = int(raw_player)
                 if valid_set is not None and player_val not in valid_set:
                     errors.append("invalid_player_id")
         out["players"].append(player_val)
@@ -270,10 +383,15 @@ def score_model_bbox_grounding(
             for b in gold_boxes_pixel if isinstance(b, (list, tuple)) and len(b) == 4
         ] or None
 
-    # player id validity (independent of coord validity, for stats)
+    # Player credit requires every scored box to name an allowed player. The
+    # first raw tag is still logged for audit, but a valid-looking dummy tag
+    # cannot lend its player id to a different box.
     pid = parsed.get("first_player")
-    fields["bbox_player_id_valid"] = pid is not None and (
-        valid_player_ids is None or int(pid) in set(valid_player_ids)
+    allowed = _allowed_players(valid_player_ids)
+    valid_players = parsed["players"]
+    fields["bbox_player_id_valid"] = bool(valid_players) and all(
+        player is not None and (allowed is None or player in allowed)
+        for player in valid_players
     )
 
     if not fields["bbox_present"]:
@@ -311,6 +429,17 @@ def score_model_bbox_grounding(
         box_format="xyxy",
     )
     iou = float(iou_result["grounding_iou"])
+    if cfg["match_mode"] == "f1" and parsed["num_found"] > parsed["num_valid"]:
+        # Invalid or unclosed tags are extra predictions, not free omissions.
+        # The weighted IoU-F1 denominator is gold_count + pred_count.
+        iou *= (len(gold_boxes_pixel) + parsed["num_valid"]) / (
+            len(gold_boxes_pixel) + parsed["num_found"]
+        )
+    if cfg.get("require_correct_player_for_iou") and (
+        allowed is None or len(allowed) != 1 or not fields["bbox_player_id_valid"]
+    ):
+        iou = 0.0
+        fields["bbox_invalid_reason"] = "invalid_player_id"
     components["iou"] = float(cfg["iou_credit"]) * iou
     fields.update({
         "metadata_bbox_iou": iou,

@@ -1,0 +1,47 @@
+{
+  "reward_scalarization": "configured_weighted_sum",
+  "version": "visual_facts_v2",
+  "weights": {
+    "answer": 0.58,
+    "grounding": 0.23,
+    "process": 0.12,
+    "consistency": 0.05,
+    "budget": 0.02
+  },
+  "routing_thresholds": {
+    "positive_min_grounding": 0.2,
+    "positive_min_process": 0.4,
+    "positive_min_visual_facts": 1.0
+  },
+  "components": {
+    "answer": {
+      "mode": "structured_fields",
+      "fields": {"spy": 0.7, "changed_attributes": 0.3},
+      "off_by_one_credit": 0.25,
+      "graded_fields": ["changed_attributes"]
+    },
+    "grounding": {
+      "format_credit": 0.0,
+      "player_id_credit": 0.1,
+      "iou_credit": 0.9,
+      "match_mode": "f1",
+      "iou_threshold": 0.1,
+      "coordinate_mode": "auto",
+      "require_correct_player_for_iou": true,
+      "warmup_steps": 0
+    },
+    "process": {
+      "mode": "visual_facts",
+      "verified_weight": 0.75,
+      "require_valid_format_for_aux": true
+    },
+    "consistency": {"mode": "field_consistency"},
+    "budget": {"fallback_tokens": 400},
+    "gating": {
+      "mode": "spy",
+      "floor": 0.0,
+      "dims": ["grounding", "process", "consistency"]
+    }
+  },
+  "notes": "Experimental verified-visual-facts reward. Each emitted attribute transition is checked against CLEVR scene metadata with multiset F1. The process dimension blends 75% verified facts with 25% prior structure score. Grounding, process, and consistency credit require a valid output format and a correct spy answer. Run with SELF_EVOLVE_VISUAL_FACTS=1 to activate the matching prompt and oracle certificate warm start."
+}

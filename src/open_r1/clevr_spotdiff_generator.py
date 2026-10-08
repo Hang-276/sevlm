@@ -6,8 +6,8 @@ from typing import List, Dict, Any, Tuple, Optional
 import PIL.Image
 
 class CLEVRSpotDiffGenerator:
-    def __init__(self, images_dir: str = "/home/colligo/clevr-dataset-gen/output/replacement_images",
-                 scenes_dir: str = "/home/colligo/clevr-dataset-gen/output/replacement_scenes",
+    def __init__(self, images_dir: str = "data/Vision-Zero-clevr-dataset/output/replacement_images",
+                 scenes_dir: str = "data/Vision-Zero-clevr-dataset/output/replacement_scenes",
                  num_players: int = 4, num_rounds: int = 2):
         """
         Initialize CLEVR spot-the-difference generator

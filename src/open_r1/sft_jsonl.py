@@ -43,9 +43,11 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import yaml
+
+from open_r1.qwen_pixels import configure_qwen_image_pixels, qwen_pixel_limits
 
 
 def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -99,10 +101,44 @@ class SFTJsonlArguments:
         metadata={"help": "YAML data-config (datasets: - json_path: ...) or a "
                           "direct sft_replay.jsonl path."}
     )
+    min_pixels: Optional[int] = field(
+        default=None,
+        metadata={"help": "Optional minimum pixels per image for visual SFT. "
+                          "Leave unset to preserve the processor default."},
+    )
+    max_pixels: Optional[int] = field(
+        default=None,
+        metadata={"help": "Optional maximum pixels per image for visual SFT. "
+                          "Leave unset to preserve the processor default."},
+    )
 
 
 # Module-level processor so the collator can reach it (mirrors sft.py).
 processor = None
+
+
+def _configure_processor_pixels(processor: Any, min_pixels: Optional[int],
+                                max_pixels: Optional[int]) -> None:
+    """Set the same Qwen image-processor knobs used by the GRPO trainer."""
+    configure_qwen_image_pixels(processor, min_pixels, max_pixels)
+
+
+def _configure_sft_training_args(training_args: Any) -> None:
+    """Keep multimodal records whole; the collator masks prompts dynamically.
+
+    TRL's generic SFT ``max_length`` defaults to 1024, shorter than even one
+    high-resolution multi-image prompt. ``skip_prepare_dataset`` bypasses that
+    truncation today, and setting ``max_length=None`` makes the intent explicit
+    if TRL's preparation path changes. The collator does not request truncation.
+    """
+    if getattr(training_args, "packing", False):
+        raise ValueError("Packed SFT is incompatible with multi-image replay")
+    training_args.dataset_kwargs = {
+        **(getattr(training_args, "dataset_kwargs", None) or {}),
+        "skip_prepare_dataset": True,
+    }
+    training_args.remove_unused_columns = False
+    training_args.max_length = None
 
 
 def _build_messages(record: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -134,26 +170,30 @@ def collate_fn(examples: List[Dict[str, Any]]):
     image_inputs = []
     for m in prompt_messages:
         imgs, _vids = process_vision_info(m)
-        image_inputs.append(imgs)
+        image_inputs.extend(imgs or [])
     batch = processor(
         text=texts,
-        images=image_inputs,
+        images=image_inputs or None,
         return_tensors="pt",
         padding=True,
     )
     prompt_batch = processor(
         text=prompt_texts,
-        images=image_inputs,
+        images=image_inputs or None,
         return_tensors="pt",
         padding=True,
     )
     labels = batch["input_ids"].clone()
-    labels[labels == processor.tokenizer.pad_token_id] = -100
+    labels[batch["attention_mask"] == 0] = -100
     # Supervise only the assistant completion. The previous collator masked
     # padding/image tokens but still trained on the user prompt.
     for i in range(len(examples)):
         prompt_len = int(prompt_batch["attention_mask"][i].sum().item())
         active_len = int(batch["attention_mask"][i].sum().item())
+        prompt_ids = prompt_batch["input_ids"][i][prompt_batch["attention_mask"][i].bool()]
+        active_ids = batch["input_ids"][i][batch["attention_mask"][i].bool()]
+        if not prompt_ids.equal(active_ids[:prompt_len]):
+            raise ValueError("SFT chat template does not preserve the assistant prompt prefix")
         start = 0 if processor.tokenizer.padding_side == "right" else labels.shape[1] - active_len
         labels[i, start:start + min(prompt_len, active_len)] = -100
     image_token_id = processor.tokenizer.convert_tokens_to_ids(processor.image_token)
@@ -192,6 +232,10 @@ def main() -> None:
     processor = AutoProcessor.from_pretrained(
         model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code
     )
+    _configure_processor_pixels(processor, script_args.min_pixels, script_args.max_pixels)
+    image_size = qwen_pixel_limits(processor)
+    print("[sft_jsonl] image pixels: "
+          f"min={image_size.get('min_pixels')} max={image_size.get('max_pixels')}")
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
@@ -221,8 +265,7 @@ def main() -> None:
     else:
         raise ValueError(f"Unsupported model: {model_args.model_name_or_path}")
 
-    training_args.dataset_kwargs = {"skip_prepare_dataset": True}
-    training_args.remove_unused_columns = False
+    _configure_sft_training_args(training_args)
 
     trainer = SFTTrainer(
         model=model,

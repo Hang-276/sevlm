@@ -12,6 +12,7 @@ model, the frontier moves as the solver improves, which is the whole point.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
@@ -122,6 +123,23 @@ def competence_line(solvability: Optional[Dict[str, Any]]) -> str:
     rate = solvability.get("mean_solve_rate")
     if rate is None:
         return ""
+    verified_rate = solvability.get("mean_verified_pass_rate")
+    if solvability.get("num_certified_tasks") == 0:
+        return (
+            f"Right now the player identifies the spy in {float(rate) * 100:.0f}% "
+            "of puzzles, but visual certificate success cannot be checked. "
+            "Keep the difficulty steady until verified feedback is available.\n"
+        )
+    if verified_rate is not None:
+        return (
+            f"Right now the player identifies the spy in {float(rate) * 100:.0f}% "
+            f"of puzzles, but completes the visual certificate (correct count, "
+            f"grounded boxes, and exact visual changes) in "
+            f"{float(verified_rate) * 100:.0f}%.\n"
+            "Help it improve its visual evidence while keeping the puzzle's "
+            "difficulty steady. Finding the spy alone is not a reason to add "
+            "more changes or players.\n"
+        )
     return (
         f"Right now the player solves {float(rate) * 100:.0f}% of the puzzles "
         f"it is given.\n"
@@ -207,6 +225,8 @@ def learnability(pass_rate: Optional[float]) -> float:
         p = float(pass_rate)
     except (TypeError, ValueError):
         return 0.0
+    if not math.isfinite(p):
+        return 0.0
     p = min(1.0, max(0.0, p))
     return round(4.0 * p * (1.0 - p), 4)
 
@@ -230,7 +250,21 @@ def score_proposals(
         record["pass_rate"] = pass_rate
         record["solver_class"] = stats.get("class")
         record["regret"] = stats.get("regret")
-        record["learnability"] = learnability(pass_rate) if stats else 0.0
+        if stats.get("mastery_mode") == "verified_visual":
+            evidence_frontier = stats.get("frontier") == "evidence"
+            certified = (stats.get("gold_certificate_available") is True
+                         and stats.get("frontier") != "unverifiable")
+            rate_for_learnability = (
+                stats.get("verified_pass_rate") if evidence_frontier else pass_rate
+            ) if certified else None
+            record["verified_pass_rate"] = stats.get("verified_pass_rate")
+            record["learnability_basis"] = (
+                "unverifiable" if not certified else
+                "verified_visual" if evidence_frontier else "spy"
+            )
+        else:
+            rate_for_learnability = pass_rate
+        record["learnability"] = learnability(rate_for_learnability) if stats else 0.0
         record["reached_solver"] = bool(stats)
         scored.append(record)
     return scored
@@ -248,27 +282,33 @@ def build_proposer_sft_examples(
     """
     examples: List[Dict[str, Any]] = []
     for proposal in scored_proposals:
+        if (proposal.get("reached_solver") is False
+                or proposal.get("learnability_basis") == "unverifiable"):
+            continue
         if float(proposal.get("learnability", 0.0)) < threshold:
             continue
         if not proposal.get("completion") or not proposal.get("prompt"):
             continue
-        examples.append(
-            {
-                "task_id": proposal.get("proposal_id"),
-                "problem": proposal.get("prompt"),
-                "prompt": proposal.get("prompt"),
-                "completion": proposal.get("completion"),
-                "solution": proposal.get("completion"),
-                "image": proposal.get("image_path"),
-                "image_path": proposal.get("image_path"),
-                "source_buffer": "proposer",
-                "role": "proposer",
-                "scene_id": proposal.get("scene_id"),
-                "keep": proposal.get("keep"),
-                "pass_rate": proposal.get("pass_rate"),
-                "learnability": proposal.get("learnability"),
-            }
-        )
+        example = {
+            "task_id": proposal.get("proposal_id"),
+            "problem": proposal.get("prompt"),
+            "prompt": proposal.get("prompt"),
+            "completion": proposal.get("completion"),
+            "solution": proposal.get("completion"),
+            "image": proposal.get("image_path"),
+            "image_path": proposal.get("image_path"),
+            "source_buffer": "proposer",
+            "role": "proposer",
+            "scene_id": proposal.get("scene_id"),
+            "keep": proposal.get("keep"),
+            "pass_rate": proposal.get("pass_rate"),
+            "learnability": proposal.get("learnability"),
+        }
+        if "learnability_basis" in proposal:
+            example["learnability_basis"] = proposal["learnability_basis"]
+        if "verified_pass_rate" in proposal:
+            example["verified_pass_rate"] = proposal["verified_pass_rate"]
+        examples.append(example)
     return examples
 
 
@@ -307,7 +347,7 @@ def proposal_report(scored_proposals: Sequence[Dict[str, Any]]) -> Dict[str, Any
 def tag_counterfactual_pairs(
     proposals: Sequence[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Find proposals for one scene that differ by exactly one object and pair them.
+    """Pair one-object edits with the same scene and requested player count.
 
     The counterfactual metric needs two tasks one object apart. Under self-play
     nobody plans pairs, but a scene's proposals often land next to each other
@@ -315,24 +355,46 @@ def tag_counterfactual_pairs(
     Each proposal joins at most one pair.
     """
     tagged = [dict(p) for p in proposals]
-    by_scene: Dict[str, List[int]] = {}
+    for p in tagged:
+        # Recomputing tags must not preserve a stale, potentially invalid pair.
+        p.pop("pair_id", None)
+        p.pop("pair_role", None)
+    by_scene_and_players: Dict[tuple[str, Optional[int]], List[int]] = {}
+    keep_sets: Dict[int, set[int]] = {}
     for i, p in enumerate(tagged):
-        if p.get("keep"):
-            by_scene.setdefault(str(p.get("scene_id")), []).append(i)
+        if not p.get("scene_id") or not isinstance(p.get("keep"), (list, tuple)):
+            continue
+        try:
+            keep = [int(index) for index in p["keep"]]
+            players = p.get("num_players")
+            if players is not None:
+                players = int(players)
+        except (TypeError, ValueError):
+            continue
+        if (not keep or min(keep) < 0 or len(set(keep)) != len(keep)
+                or (players is not None and players < 1)):
+            continue
+        keep_sets[i] = set(keep)
+        # Missing counts are grouped only with other missing counts; the
+        # generator gives both the same configured default player count.
+        by_scene_and_players.setdefault(
+            (str(p["scene_id"]), players), []
+        ).append(i)
 
-    for scene_id, indices in by_scene.items():
+    for (scene_id, players), indices in by_scene_and_players.items():
         used: set = set()
         for a in indices:
             if a in used:
                 continue
-            small = set(tagged[a]["keep"])
+            small = keep_sets[a]
             for b in indices:
                 if b == a or b in used or a in used:
                     continue
-                large = set(tagged[b]["keep"])
+                large = keep_sets[b]
                 if len(large) != len(small) + 1 or not small < large:
                     continue
-                pair_id = (f"{scene_id}::"
+                player_tag = "default" if players is None else str(players)
+                pair_id = (f"{scene_id}::players{player_tag}::"
                            f"{'-'.join(map(str, sorted(small)))}|"
                            f"{'-'.join(map(str, sorted(large)))}")
                 tagged[a]["pair_id"] = pair_id

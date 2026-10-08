@@ -60,7 +60,7 @@ python -m pytest -q tests/test_vllm_rollout.py
 # inputs and a diagnostic reward to exercise two real optimizer updates.
 CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 \
 python tests/smoke_grpo_vllm_gpu.py \
-  --model /jizhicfs/rtliu/models/Qwen2.5-VL-7B-Instruct
+  --model /path/to/models/Qwen2.5-VL-7B-Instruct
 ```
 
 The GPU smoke makes HF `generate()` raise an error, so passing requires actual

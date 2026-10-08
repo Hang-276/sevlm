@@ -35,6 +35,7 @@ is present in the environment.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -49,7 +50,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from open_r1.self_evolve.io import read_jsonl, write_jsonl  # noqa: E402
+from open_r1.self_evolve.io import read_json, read_jsonl, write_json, write_jsonl  # noqa: E402
 from open_r1.self_evolve.iteration_state import (  # noqa: E402
     IterationState,
     build_failure_profile_from_counts,
@@ -71,6 +72,7 @@ from open_r1.self_evolve.policy_clevr_generator import (  # noqa: E402
 )
 from open_r1.self_evolve.iteration import score_and_route_trajectories, split_buffers  # noqa: E402
 from open_r1.self_evolve.reward_config import load_reward_config  # noqa: E402
+from open_r1.self_evolve.protocol_fingerprint import self_evolve_protocol_fingerprint  # noqa: E402
 from open_r1.self_evolve.regret import counterfactual_sensitivity, summarize, task_statistics  # noqa: E402
 from open_r1.self_evolve.proposer import ProposerConfig  # noqa: E402
 from open_r1.self_evolve.reference_judge import (  # noqa: E402
@@ -469,8 +471,7 @@ def run_reference_stage(
             while True:
                 # Judge `pending` in waves of `effective_workers`. Between waves
                 # re-check quota/budget; a wave is clamped to the remaining
-                # budget so it stays a hard cap (we may judge up to wave_size-1
-                # extra past the exact quota hit — harmless under oversampling).
+                # budget and quota so concurrent calls cannot exceed either.
                 idx = 0
                 while idx < len(pending):
                     if len(accepted) >= quota_target:
@@ -479,7 +480,8 @@ def run_reference_stage(
                     if room <= 0:
                         budget_exhausted = True
                         break
-                    wave = pending[idx: idx + min(effective_workers, room)]
+                    wave = pending[idx: idx + min(effective_workers, room,
+                                                 quota_target - len(accepted))]
                     idx += len(wave)
                     # Concurrent network round-trips; results collected in order.
                     judgments = list(pool.map(judge, wave))
@@ -780,7 +782,7 @@ def run_solver_stage(
     base_model_path: Optional[str] = None,
     num_gpus: int = 1,
     scratch_dir: Optional[str] = None,
-    solver_max_new_tokens: int = 1024,
+    solver_max_new_tokens: int = 2048,
     solver_temperature: float = 1.0,
     solver_top_p: float = 0.95,
     solver_min_pixels: Optional[int] = None,
@@ -1608,6 +1610,114 @@ def _ensure_grpo_train_init_model(
     return info
 
 
+def _has_model_checkpoint(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    if (path / "adapter_config.json").is_file():
+        return any((path / name).is_file() and (path / name).stat().st_size > 0
+                   for name in ("adapter_model.safetensors", "adapter_model.bin"))
+    if not (path / "config.json").is_file():
+        return False
+    indexes = [path / name for name in
+               ("model.safetensors.index.json", "pytorch_model.bin.index.json")
+               if (path / name).is_file()]
+    if indexes:
+        for index in indexes:
+            try:
+                weights = read_json(index)["weight_map"]
+                if not isinstance(weights, dict) or not weights:
+                    return False
+                if any(not isinstance(name, str) or Path(name).name != name
+                       or not (path / name).is_file() or (path / name).stat().st_size == 0
+                       for name in weights.values()):
+                    return False
+            except (OSError, ValueError, KeyError, TypeError):
+                return False
+        return True
+    return any((path / name).is_file() and (path / name).stat().st_size > 0
+               for name in ("model.safetensors", "pytorch_model.bin"))
+
+
+def _prepare_run_protocol(output_root: Path, protocol_hash: str, method_env: dict,
+                          resume_disabled: bool) -> None:
+    protocol_file = output_root / "experiment_protocol.json"
+    has_iterations = any(path.is_dir() for path in output_root.glob("iter_*"))
+    if resume_disabled and has_iterations:
+        raise SystemExit(
+            "Force-fresh cannot reuse a directory containing iteration artifacts. "
+            "Choose a fresh RUN_TAG/output-root so old completion markers and checkpoints cannot be reused."
+        )
+    if not resume_disabled and (has_iterations or protocol_file.exists()):
+        try:
+            saved = read_json(protocol_file)
+            if not isinstance(saved, dict):
+                raise ValueError("protocol must be an object")
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"{output_root} has no readable run protocol; choose a fresh RUN_TAG.") from exc
+        if saved.get("sha256") != protocol_hash:
+            raise SystemExit(
+                f"{output_root} uses different code, reward, or run settings; choose a fresh RUN_TAG."
+            )
+    write_json(protocol_file, {"sha256": protocol_hash, "method_env": method_env})
+
+
+def _completed_iteration(iter_dir: Path, iteration_index: int) -> bool:
+    marker = iter_dir / "iteration_state.json"
+    if not marker.is_file():
+        return False
+    try:
+        state = read_json(marker)
+        if (state["iteration_index"] != iteration_index
+                or state["iteration_id"] != iter_dir.name):
+            raise ValueError("iteration identity mismatch")
+        for name in ("generator_policy.json", "failure_profile.json", "solver_update_state.json"):
+            if not isinstance(read_json(iter_dir / name), dict):
+                raise ValueError(f"invalid {name}")
+        solver_state = load_solver_update_state(iter_dir)
+        if (solver_state.get("iteration_id") != iter_dir.name
+                or solver_state.get("solver_model_path") != state.get("solver_model_path")):
+            raise ValueError("solver state mismatch")
+        if solver_state.get("checkpoint_created"):
+            if not _has_model_checkpoint(Path(solver_state["solver_model_path"])):
+                raise ValueError("completed model checkpoint is missing or incomplete")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError(f"Cannot resume completed iteration {iter_dir}: {exc}") from exc
+    return True
+
+
+def _records_digest(records) -> str:
+    encoded = json.dumps(records, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _restore_reference_stage(iter_dir: Path) -> Dict[str, Any]:
+    state = read_json(iter_dir / "reference_stage_state.json")
+    candidates = read_jsonl(iter_dir / "candidate_tasks.jsonl")
+    accepted = read_jsonl(iter_dir / "accepted_tasks.jsonl")
+    feedback = read_jsonl(reference_feedback_path(iter_dir))
+    if (not isinstance(state, dict) or state.get("num_accepted") != len(accepted)
+            or state.get("num_judged") != len(feedback)
+            or state.get("reference_accounting", {}).get("accepted") != len(accepted)
+            or state.get("candidate_sha256") != _records_digest(candidates)
+            or state.get("accepted_sha256") != _records_digest(accepted)
+            or state.get("feedback_sha256") != _records_digest(feedback)):
+        raise RuntimeError(f"Cannot resume inconsistent Reference VLM stage in {iter_dir}")
+    return {**state, "accepted_tasks": accepted, "reference_feedback": feedback, "resumed": True}
+
+
+def _validate_solver_replay(trajectories, accepted_tasks, num_generations: int) -> None:
+    expected = {str(task["task_id"]): num_generations for task in accepted_tasks}
+    if len(expected) != len(accepted_tasks):
+        raise RuntimeError("Accepted tasks have duplicate task IDs")
+    counts: Dict[str, int] = defaultdict(int)
+    for trajectory in trajectories:
+        if not isinstance(trajectory, dict) or trajectory.get("task_id") is None:
+            raise RuntimeError("Invalid solver trajectory")
+        counts[str(trajectory["task_id"])] += 1
+    if counts != expected:
+        raise RuntimeError("Solver trajectories do not match the accepted tasks/generation count")
+
+
 def run_trainer_stage(
     export_summary: Dict[str, Any],
     *,
@@ -1635,7 +1745,8 @@ def run_trainer_stage(
                                                  post_sft else round)
 
     Each of ``execute_sft`` / ``execute_grpo`` independently
-    gates its stage; a disabled stage is skipped and the chain closes over it.
+    gates its stage; a disabled or unavailable SFT stage is skipped and the
+    GRPO command starts from the round model.
     """
     pathways = default_training_pathways()
     scale = scale or TrainerScale()
@@ -1659,19 +1770,19 @@ def run_trainer_stage(
     sft_ckpt_dir = str(iter_dir / "checkpoints" / "sft_qwen2_5_vl")
 
     num_sft = int(export_summary.get("num_sft_replay", 0))
-    # SFT runs only when the SOLVER produced positives. Proposer records ride
-    # the same file, so counting the total here would let a round with zero
-    # solver positives launch SFT on proposer-only data — which teaches the
-    # model to answer every prompt with <keep>[...]</keep>, and GRPO then
-    # starts from that checkpoint.
-    num_sft_solver = int(export_summary.get("num_sft_solver", num_sft))
+    # A solving target must be present before SFT. In the visual-facts mode,
+    # verified certificates and original-scene QA are also solving targets;
+    # proposer-only replay still cannot start an SFT stage.
+    num_sft_non_proposer = int(export_summary.get(
+        "num_sft_non_proposer", export_summary.get("num_sft_solver", num_sft)
+    ))
 
     pathways["grpo"].export_ready = bool(export_summary.get("num_grpo_tasks", 0))
     pathways["grpo"].export_path = grpo_path
     pathways["grpo"].trainer_input_ready = bool(grpo_yaml)
-    pathways["sft"].export_ready = bool(num_sft_solver)
+    pathways["sft"].export_ready = bool(num_sft_non_proposer)
     pathways["sft"].export_path = sft_path
-    pathways["sft"].trainer_input_ready = bool(num_sft_solver)
+    pathways["sft"].trainer_input_ready = bool(num_sft_non_proposer)
 
     # Resolve the accumulated model for this round. Iteration 0 is a cold start
     # from base; later rounds merge the previous GRPO adapter first.
@@ -1689,23 +1800,24 @@ def run_trainer_stage(
     round_model = solver_lineage["grpo_train_init_model"]
 
     # --- SFT stage (positive buffer) ---
-    sft_yaml = _write_sft_yaml(str(sft_path), iter_dir / "exports") if (sft_path and num_sft_solver) else None
+    sft_yaml = _write_sft_yaml(str(sft_path), iter_dir / "exports") if (sft_path and num_sft_non_proposer) else None
     sft_cmd = _build_sft_command(sft_yaml, round_model, sft_ckpt_dir, max_steps, use_lora=use_lora, scale=scale) if sft_yaml else None
+    sft_will_run = bool(execute_sft and sft_cmd)
     # Full-parameter: sft_ckpt_dir is itself a full model, no merge → the next
     # stage starts straight from it. LoRA: merge the adapter into merged_sft_*.
     post_sft_model = sft_ckpt_dir if full_param else str(iter_dir / "merged_sft_qwen2_5_vl")
 
     # --- GRPO stage — starts from post-SFT if SFT ran, else the round model.
-    grpo_input_model = post_sft_model if execute_sft else round_model
+    grpo_input_model = post_sft_model if sft_will_run else round_model
     grpo_cmd = _build_grpo_command(str(grpo_path), grpo_input_model, grpo_ckpt_dir, max_steps, use_lora=use_lora, scale=scale) if grpo_path else None
 
     _recipe = "_".join(
-        (["sft"] if execute_sft else []) + (["grpo"] if grpo_cmd else [])
+        (["sft"] if sft_will_run else []) + (["grpo"] if grpo_cmd else [])
     ) or "none"
     solver_lineage["training_recipe"] = _recipe
     solver_lineage["round_model_path"] = round_model
-    solver_lineage["sft_adapter_path"] = sft_ckpt_dir if execute_sft else None
-    solver_lineage["post_sft_merged_model_path"] = post_sft_model if execute_sft else None
+    solver_lineage["sft_adapter_path"] = sft_ckpt_dir if sft_will_run else None
+    solver_lineage["post_sft_merged_model_path"] = post_sft_model if sft_will_run else None
     solver_lineage["grpo_input_model_path"] = grpo_input_model
     # Store commands in next_action so they land in state JSON (readable proof).
     if grpo_cmd:
@@ -1716,14 +1828,14 @@ def run_trainer_stage(
     if execute_sft and not sft_cmd:
         pathways["sft"].status = "mandatory_but_blocked"
         pathways["sft"].blocked_reason = (
-            "No solver SFT replay records this iteration (the positive buffer "
-            "is empty under this solver). SFT is mandatory; it needs >=1 "
-            "positive solver trajectory. Proposer records alone do not qualify: "
+            "No solving SFT replay records this iteration (positive solver, "
+            "verified certificate, or original-scene QA). SFT is mandatory; "
+            "it needs >=1 solving target. Proposer records alone do not qualify: "
             "training on them without any solving example teaches the model to "
             "propose instead of answer."
         )
         pathways["sft"].next_action = (
-            "Increase accepted tasks / generations until a positive trajectory "
+            "Increase accepted tasks / generations until a solving target "
             "is produced, then run src/open_r1/sft_jsonl.py."
         )
     elif not execute_sft:
@@ -1737,6 +1849,14 @@ def run_trainer_stage(
     def _launch(name: str, cmd: List[str], ckpt_dir: str) -> bool:
         """Launch one trainer smoke; record state; return checkpoint_created."""
         nonlocal trainer_mode
+        checkpoint = Path(ckpt_dir)
+
+        def weight_stamp():
+            return {str(path.relative_to(checkpoint)): (path.stat().st_mtime_ns, path.stat().st_size)
+                    for suffix in ("*.safetensors", "*.bin")
+                    for path in checkpoint.glob(suffix) if path.is_file()}
+
+        previous_weights = weight_stamp()
         log(f"  Trainer: LAUNCHING real {name.upper()} smoke (GPU)…")
         log("    " + " ".join(cmd))
         import subprocess
@@ -1764,7 +1884,7 @@ def run_trainer_stage(
         # deepspeed, so scope these to name == "grpo".
         is_fsdp2 = getattr(scale, "trainer_backend", "deepspeed") == "fsdp2" and name == "grpo"
         if is_fsdp2:
-            run_env["FSDP_VERSION"] = "1"
+            run_env["FSDP_VERSION"] = "2"
             run_env["FSDP_STATE_DICT_TYPE"] = "FULL_STATE_DICT"
         # Ensure the trainer interpreter's bin dir is on PATH so DeepSpeed's JIT
         # build of the CPU-Adam C++ extension can find `ninja` (it shells out to
@@ -1779,7 +1899,7 @@ def run_trainer_stage(
         pathways[name].status = "trainer_executed" if rc == 0 else "trainer_failed"
         made = False
         ckpt = Path(ckpt_dir)
-        if rc == 0 and ckpt.is_dir() and any(ckpt.iterdir()):
+        if rc == 0 and _has_model_checkpoint(ckpt) and weight_stamp() != previous_weights:
             pathways[name].checkpoint_created = True
             pathways[name].checkpoint_path = ckpt_dir
             made = True
@@ -1790,7 +1910,7 @@ def run_trainer_stage(
         elif not made:
             pathways[name].status = "trainer_failed"
             pathways[name].blocked_reason = (
-                f"{name} trainer exited successfully but created no checkpoint."
+                f"{name} trainer exited successfully but created or updated no complete model checkpoint."
             )
         log(f"  Trainer: {name.upper()} smoke rc={rc}, checkpoint_created={made}")
         return made
@@ -1822,13 +1942,11 @@ def run_trainer_stage(
         # SFT → GRPO. SFT merges into a full model that GRPO starts from, so
         # GRPO always begins from the latest weights.
         stage_ready = True
-        if execute_sft:
-            if not sft_cmd:
-                log("  Trainer: WARNING — no positive SFT replay examples this "
-                    "iteration (expected early on: positives now require a "
-                    "grounded box). Skipping SFT; GRPO starts from the round model.")
-                execute_sft = False
-        if execute_sft:
+        if execute_sft and not sft_will_run:
+            log("  Trainer: WARNING — no positive SFT replay examples this "
+                "iteration (expected early on: positives now require a "
+                "grounded box). Skipping SFT; GRPO starts from the round model.")
+        if sft_will_run:
             stage_ready = _launch("sft", sft_cmd, sft_ckpt_dir)
             # Full-parameter: sft_ckpt_dir is already the full model (post_sft_model
             # points at it), so no merge. LoRA: merge the adapter into post_sft_model.
@@ -1849,7 +1967,7 @@ def run_trainer_stage(
     else:
         # Dry-run: print the real commands; nothing launched.
         log("  Trainer: DRY-RUN — real commands constructed, NOT launched:")
-        if execute_sft and sft_cmd:
+        if sft_will_run:
             log("    [SFT ] " + " ".join(sft_cmd))
             log(f"    [MERGE] {sft_ckpt_dir} -> {post_sft_model}")
         if grpo_cmd:
@@ -2171,51 +2289,18 @@ def run_one_iteration(
         and _cand_path.is_file()
         and _accepted_path.is_file()
         and _ref_fb_path.is_file()
+        and (iter_dir / "reference_stage_state.json").is_file()
     )
 
     if _can_resume:
         candidate_tasks = read_jsonl(_cand_path)
-        accepted_tasks = read_jsonl(_accepted_path)
-        reference_feedback = read_jsonl(_ref_fb_path)
+        ref = _restore_reference_stage(iter_dir)
+        accepted_tasks = ref["accepted_tasks"]
+        reference_feedback = ref["reference_feedback"]
         gen_source = (
             candidate_tasks[0].get("generation_source", "clevr_spot_diff_generator")
             if candidate_tasks else "clevr_spot_diff_generator"
         )
-        # Reconstruct only what downstream (solver stage + IterationState)
-        # actually reads. Counts derive from the loaded lists; other fields
-        # fill to 0/empty. mode="resumed_from_disk" + resumed=True make this
-        # auditable in the run's iteration_state.json.
-        ref = {
-            "accepted_tasks": accepted_tasks,
-            "reference_feedback": reference_feedback,
-            "mode": "resumed_from_disk",
-            "num_judged": len(reference_feedback),
-            "num_accepted": len(accepted_tasks),
-            "num_rejected": 0,
-            "num_regenerated": 0,
-            "num_rejected_final": 0,
-            "reference_judged_tasks_count": len(reference_feedback),
-            "unjudged_passthrough_tasks_count": 0,
-            "accepted_tasks_count": len(accepted_tasks),
-            "candidate_tasks_count": len(candidate_tasks),
-            "reference_judge_budget_cap": 0,
-            "dropped_candidate_count": 0,
-            "drop_reason_histogram": {},
-            "reference_accounting": {
-                "quota_target": quota_target,
-                "accepted": len(accepted_tasks),
-                "judged": len(reference_feedback),
-                "judge_budget": 0,
-                "reject_count": 0,
-                "num_regenerated": 0,
-                "passthrough_count": 0,
-                "quota_shortfall": 0,
-                "budget_exhausted": False,
-                "generator_exhausted": False,
-                "reject_reason_histogram": {},
-            },
-            "resumed": True,
-        }
         _prop_path = iter_dir / "proposals.jsonl"
         if args.self_play and _prop_path.is_file():
             proposals = read_jsonl(_prop_path)
@@ -2234,6 +2319,7 @@ def run_one_iteration(
             edit_fraction=args.edit_fraction,
             counterfactual_pairs=not args.no_counterfactual_pairs,
             label_balance=args.label_balance,
+            variant_cache_dir=str(iter_dir / "variant_cache"),
         )
         generator = PolicyControlledCLEVRGenerator(gen_cfg)
 
@@ -2327,6 +2413,13 @@ def run_one_iteration(
                 max_regenerate_attempts=args.max_regenerate_attempts,
                 log=log,
             )
+        write_json(iter_dir / "reference_stage_state.json", {
+            **{key: value for key, value in ref.items()
+               if key not in ("accepted_tasks", "reference_feedback")},
+            "candidate_sha256": _records_digest(candidate_tasks),
+            "accepted_sha256": _records_digest(ref["accepted_tasks"]),
+            "feedback_sha256": _records_digest(ref["reference_feedback"]),
+        })
         write_jsonl(reference_feedback_path(iter_dir), ref["reference_feedback"])
         write_jsonl(iter_dir / "accepted_tasks.jsonl", ref["accepted_tasks"])
         log(f"  Reference VLM [{ref['mode']}]: judged={ref['num_judged']} "
@@ -2357,10 +2450,12 @@ def run_one_iteration(
     _solver_traj_path = iter_dir / "raw_solver_trajectories.jsonl"
     _resume_solver = (
         os.environ.get("SELF_EVOLVE_DISABLE_RESUME", "0") != "1"
+        and _can_resume
         and _solver_traj_path.is_file()
     )
     if _resume_solver:
         _trajs = read_jsonl(_solver_traj_path)
+        _validate_solver_replay(_trajs, ref["accepted_tasks"], args.num_generations)
         _src = (_trajs[0].get("rollout_source") if _trajs else None) or (
             "dry_run_solver" if args.dry_run_solver else "real_solver"
         )
@@ -2389,6 +2484,7 @@ def run_one_iteration(
             solver_max_pixels=args.solver_max_pixels,
             log=log,
         )
+        _validate_solver_replay(solver["trajectories"], ref["accepted_tasks"], args.num_generations)
         write_jsonl(iter_dir / "raw_solver_trajectories.jsonl", solver["trajectories"])
 
     # --- 6. Reward + failure tags + buffers ---
@@ -2433,12 +2529,25 @@ def run_one_iteration(
     by_task: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for _ex in scored:
         by_task[str(_ex.get("task_id"))].append(_ex)
-    task_stats = task_statistics(by_task)
+    mastery_mode = os.environ.get("SELF_EVOLVE_MASTERY_MODE", "spy")
+    if mastery_mode == "verified_visual":
+        mastery_config = getattr(args, "_reward_config", None)
+        if mastery_config is None or mastery_config.process_cfg["mode"] != "visual_facts":
+            raise ValueError("verified_visual mastery requires the visual_facts reward configuration")
+        task_stats = task_statistics(
+            by_task, mastery_mode=mastery_mode, accepted_tasks=ref["accepted_tasks"],
+            min_grounding=mastery_config.positive_min_grounding,
+            min_visual_facts=mastery_config.positive_min_visual_facts,
+        )
+    else:
+        task_stats = task_statistics(by_task, mastery_mode=mastery_mode)
     solvability = summarize(task_stats)
     log(f"  Solvability: mean_solve_rate={solvability.get('mean_solve_rate')} "
         f"mean_regret={solvability.get('mean_regret')} "
         f"collapse={solvability.get('advantage_collapse_rate')} "
-        f"seeds={len(solvability.get('seeds', []))}")
+        f"seeds={len(solvability.get('seeds', []))}, "
+        f"verified_solve_rate={solvability.get('mean_verified_pass_rate')}, "
+        f"frontiers={solvability.get('frontier_counts', {})}")
 
     # --- 6b. Close the self-play loop: pay the proposer what the solver did ---
     # A proposal is good exactly when the solver landed in the middle on the
@@ -2488,8 +2597,12 @@ def run_one_iteration(
     )
     log(f"  Exports: sft={export_summary['num_sft_replay']} "
         f"(solver={export_summary['num_sft_solver']}, "
+        f"verified_oracle={export_summary['num_sft_verified_oracle']}, "
+        f"scene_qa={export_summary['num_sft_scene_qa']}, "
         f"proposer={export_summary['num_sft_proposer']}) "
-        f"grpo={export_summary['num_grpo_tasks']}")
+        f"grpo={export_summary['num_grpo_tasks']} "
+        f"(spy={export_summary['num_grpo_spy']}, "
+        f"counterfactual_qa={export_summary['num_grpo_counterfactual_qa']})")
 
     # --- 8. Trainer invocation state (MANDATORY pathways) ---
     trainer = run_trainer_stage(
@@ -2771,7 +2884,7 @@ def main() -> None:
     # comparison before the evidence boxes are emitted, and temperature 0.2
     # makes the rollout group nearly identical, which flattens the GRPO
     # group-relative advantage.
-    parser.add_argument("--solver-max-new-tokens", type=int, default=1024)
+    parser.add_argument("--solver-max-new-tokens", type=int, default=2048)
     parser.add_argument("--solver-temperature", type=float, default=1.0)
     parser.add_argument("--solver-top-p", type=float, default=0.95)
     # Must match the trainer's --min_pixels/--max_pixels, or the buffers are
@@ -2832,7 +2945,7 @@ def main() -> None:
         if not getattr(args, dest, None):
             raise SystemExit(f"[ERROR] {flag} is required (no default; set it in paths.sh)")
 
-    # Load .env (gitignored) if present — shell env always wins (override=False).
+    # Load a local .env if present; exported variables take precedence.
     try:
         from open_r1.self_evolve.dotenv_loader import load_dotenv
         loaded = load_dotenv()
@@ -2874,6 +2987,14 @@ def main() -> None:
     if getattr(args, "reference_provider", None):
         os.environ.setdefault("SELF_EVOLVE_REFERENCE_PROVIDER", args.reference_provider)
     args._reward_config = reward_config
+    mastery_mode = os.environ.get("SELF_EVOLVE_MASTERY_MODE", "spy")
+    if mastery_mode not in ("spy", "verified_visual"):
+        raise SystemExit("SELF_EVOLVE_MASTERY_MODE must be spy or verified_visual")
+    if mastery_mode == "verified_visual" and reward_config.process_cfg["mode"] != "visual_facts":
+        raise SystemExit("verified_visual mastery requires the visual_facts reward configuration")
+    qa_fraction = float(os.environ.get("SELF_EVOLVE_COUNTERFACTUAL_QA_FRACTION", "0"))
+    if not math.isfinite(qa_fraction) or not 0.0 <= qa_fraction <= 0.5:
+        raise SystemExit("SELF_EVOLVE_COUNTERFACTUAL_QA_FRACTION must be finite and in [0, 0.5]")
 
     # Export the base solver model so the online_solver module
     # default to THIS run's --model-path instead of a hardcoded machine path.
@@ -2905,6 +3026,33 @@ def main() -> None:
 
     output_root = Path(args.output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
+    resume_disabled = os.environ.get("SELF_EVOLVE_DISABLE_RESUME", "0") == "1"
+    # A completed iteration otherwise skips every stage solely because its
+    # state file exists. Never let a new reward/parser/training recipe inherit
+    # old buffers or checkpoints under the same RUN_TAG.
+    method_env_keys = (
+        "SELF_EVOLVE_VISUAL_FACTS", "SELF_EVOLVE_BOOTSTRAP_PAIR_FRACTION",
+        "SELF_EVOLVE_ORACLE_SFT_MAX", "SELF_EVOLVE_SCENE_QA_MAX",
+        "SELF_EVOLVE_AUX_SFT_MAX_RATIO", "SELF_EVOLVE_ANSWER_JUDGE",
+        "SELF_EVOLVE_MASTERY_MODE", "SELF_EVOLVE_COUNTERFACTUAL_QA_FRACTION",
+        "SELF_EVOLVE_ANSWER_JUDGE_LIVE", "SELF_EVOLVE_ANSWER_JUDGE_FORCE",
+        "SELF_EVOLVE_ANSWER_JUDGE_SAMPLE_N", "SELF_EVOLVE_GRPO_EXTRA_ARGS",
+        "SELF_EVOLVE_SFT_EXTRA_ARGS",
+        "SELF_EVOLVE_TOO_HARD_GAP", "SELF_EVOLVE_REFERENCE_PROVIDER",
+        "SELF_EVOLVE_ALLOW_TRAINER_FAILURE", "SELF_EVOLVE_SOLVER_NUM_GPUS",
+        "REFERENCE_PROVIDER", "ANSWER_JUDGE_MODEL", "ANSWER_JUDGE_BASE_URL",
+        "OPENAI_MODEL", "OPENAI_BASE_URL", "OPENROUTER_MODEL", "OPENROUTER_BASE_URL",
+        "LLM_JUDGE_MODEL", "REFERENCE_VLM_MODEL",
+    )
+    protocol_input = {
+        "code_and_reward_sha256": self_evolve_protocol_fingerprint(reward_config.path),
+        "args": {key: value for key, value in vars(args).items() if not key.startswith("_")},
+        "method_env": {key: os.environ.get(key) for key in method_env_keys},
+    }
+    protocol_hash = hashlib.sha256(
+        json.dumps(protocol_input, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    _prepare_run_protocol(output_root, protocol_hash, protocol_input["method_env"], resume_disabled)
 
     def log(msg: str) -> None:
         print(msg, flush=True)
@@ -2951,13 +3099,12 @@ def main() -> None:
     # re-enter at the first incomplete/missing one. run_one_iteration then does
     # stage-level resume within that iter (skips generator+GPT-4o / solver whose
     # artefacts already landed). Set SELF_EVOLVE_DISABLE_RESUME=1 to force fresh.
-    resume_disabled = os.environ.get("SELF_EVOLVE_DISABLE_RESUME", "0") == "1"
     prev_dir: Optional[Path] = None
     start_index = 0
     if not resume_disabled:
         for i in range(args.num_iterations):
             cand = output_root / f"iter_{i:03d}"
-            if (cand / "iteration_state.json").is_file():
+            if _completed_iteration(cand, i):
                 prev_dir = cand
                 start_index = i + 1
                 log(f"  [resume] iter_{i:03d} already complete "

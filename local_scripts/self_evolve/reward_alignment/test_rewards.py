@@ -398,8 +398,14 @@ check("the live profile carries solvability through to the policy",
 # --------------------------------------------------------------------------
 print("counterfactual sensitivity")
 ans = lambda ca: f"<think>t</think><answer>spy=1; changed_attributes={ca}</answer>"
-tasks_cf = [{"task_id": "t_small", "pair_id": "p", "pair_role": "small"},
-            {"task_id": "t_large", "pair_id": "p", "pair_role": "large"}]
+tasks_cf = [
+    {"task_id": "t_small", "pair_id": "p", "pair_role": "small", "scene_id": "s",
+     "metadata": {"num_players": 3, "spy_player": 1,
+                  "variant": {"keep_indices": [0]}}},
+    {"task_id": "t_large", "pair_id": "p", "pair_role": "large", "scene_id": "s",
+     "metadata": {"num_players": 3, "spy_player": 1,
+                  "variant": {"keep_indices": [0, 1]}}},
+]
 blind = [{"task_id": "t_small", "completion": ans(4)},
          {"task_id": "t_large", "completion": ans(4)}]
 seeing = [{"task_id": "t_small", "completion": ans(2)},

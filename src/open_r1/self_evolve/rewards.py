@@ -70,14 +70,28 @@ def extract_reasoning(text: Optional[str]) -> str:
 # Evidence <bbox> tags may sit between </think> and <answer> (evidence-before-
 # conclusion order) or after </answer>; both are valid.
 _FORMAT_VALID_RE = re.compile(
-    r"<think>.*?</think>\s*(?:<bbox[^>]*>[^<]*</bbox>\s*)*<answer>.*?</answer>",
+    r"\s*<think>.*?</think>\s*"
+    r"(?:<bbox[^>]*>[^<]*</bbox>\s*|<change>[^<]*</change>\s*)*"
+    r"<answer>[^<]*</answer>\s*"
+    r"(?:<bbox[^>]*>[^<]*</bbox>\s*)*",
     re.DOTALL,
 )
 
 
 def is_format_valid(completion: Optional[str]) -> bool:
-    """True iff the completion has <think>…</think> then <answer>…</answer>."""
-    return bool(_FORMAT_VALID_RE.search(completion or ""))
+    """Require one complete reasoning/answer pair with no trailing claims.
+
+    Legacy evidence boxes after the answer are still accepted; visual-change
+    certificates belong before the answer. Anchoring matters for SFT routing:
+    a correct first answer followed by a contradictory second answer must not
+    become a positive replay example.
+    """
+    text = completion or ""
+    return (
+        text.count("<think>") == text.count("</think>") == 1
+        and text.count("<answer>") == text.count("</answer>") == 1
+        and bool(_FORMAT_VALID_RE.fullmatch(text))
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +133,8 @@ def parse_structured_answer(text: Optional[str]) -> Dict[str, Optional[int]]:
         # numbers inside <think> cannot be mined for credit.
         if match is None and "<answer>" not in (text or ""):
             match = pattern.search(text or "")
-        out[field_name] = int(match.group(1)) if match else None
+        raw = match.group(1) if match else ""
+        out[field_name] = int(raw) if raw and len(raw) <= 10 else None
     return out
 
 
@@ -861,6 +876,7 @@ def process_reward(
     reference_reasoning: Optional[str] = None,
     reference_reasoning_steps: Optional[List[str]] = None,
     task_metadata: Optional[Dict[str, Any]] = None,
+    process_config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[float, Dict[str, Any]]:
     """Process reward: reference-step distance + causal structure + shortcut detection.
 
@@ -874,14 +890,30 @@ def process_reward(
     Returns:
         (score, details_dict)
     """
+    process_cfg = process_config or _active_reward_config().process_cfg
+    meta = task_metadata or {}
     reasoning = extract_reasoning(completion)
     if reasoning == "":
+        if process_cfg["mode"] == "visual_facts":
+            from open_r1.self_evolve.visual_facts import score_visual_changes
+
+            verified, fact_details = score_visual_changes(
+                completion, meta.get("gold_visual_changes") or []
+            )
+            weight = float(process_cfg["verified_weight"])
+            return weight * verified, {
+                "process_source": "verified_visual_facts",
+                "model_reasoning_steps": [],
+                "visual_facts_score": verified,
+                "visual_facts_weight": weight,
+                "visual_facts": fact_details,
+                "shortcut_flag": False,
+            }
         return 0.0, {"process_source": "empty_reasoning", "model_reasoning_steps": []}
 
     model_steps = parse_reasoning_steps(reasoning)
 
     # Resolve reference steps
-    meta = task_metadata or {}
     ref_steps = reference_reasoning_steps or meta.get("reference_reasoning_steps")
     # Also try to parse from reference_reasoning string
     if not ref_steps and reference_reasoning:
@@ -953,6 +985,22 @@ def process_reward(
         details["shortcut_penalty_applied"] = False
 
     process_score = max(0.0, min(1.0, process_raw))
+    if process_cfg["mode"] == "visual_facts":
+        # A certificate earns credit only for attribute transitions supported
+        # by the actual images' scene metadata. A multiset F1 charges for
+        # repeated or speculative claims, unlike the lexical structure score.
+        from open_r1.self_evolve.visual_facts import score_visual_changes
+
+        gold_changes = meta.get("gold_visual_changes")
+        verified, fact_details = score_visual_changes(
+            completion, gold_changes if isinstance(gold_changes, list) else []
+        )
+        weight = float(process_cfg["verified_weight"])
+        process_score = weight * verified + (1.0 - weight) * process_score
+        details["process_source"] = "verified_visual_facts"
+        details["visual_facts_score"] = verified
+        details["visual_facts_weight"] = weight
+        details["visual_facts"] = fact_details
     details["shortcut_flag"] = is_shortcut
     return process_score, details
 
@@ -970,12 +1018,13 @@ def grounding_reward(
     completion: Optional[str] = None,
     image_width: Optional[int] = None,
     image_height: Optional[int] = None,
+    grounding_config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[float, Dict[str, Any]]:
     """Grounding reward with model-bbox priority.
 
     Priority:
-    1. Model-emitted normalized ``<bbox>`` parsed from the completion → convert
-       to pixels → IoU vs gold pixel boxes. source_type=metadata_bbox_iou.
+    1. Model-emitted ``<bbox>`` parsed from the completion (normalized or
+       pixels per config) → IoU vs gold pixel boxes. source_type=metadata_bbox_iou.
     2. Else pre-supplied predicted_evidence_boxes (keyword→metadata proxy) → IoU.
     3. Else external grounding_score → clamp (fallback).
     4. Else 0.0.
@@ -1002,7 +1051,7 @@ def grounding_reward(
     if image_height is None:
         image_height = 240
 
-    # --- Layer 1: parse model-emitted normalized bbox from the completion ---
+    # --- Layer 1: parse model-emitted bbox from the completion ---
     # Delegate to score_model_bbox_grounding so the
     # offline scorer and the live GRPO reward compute the SAME model-bbox IoU
     # and emit the SAME audit fields (no divergent second implementation).
@@ -1022,7 +1071,7 @@ def grounding_reward(
             image_width=int(image_width),
             image_height=int(image_height),
             valid_player_ids=valid_player_ids,
-            config=_active_grounding_cfg(),
+            config=grounding_config or _active_grounding_cfg(),
         )
         # Only short-circuit to the model-bbox signal when a valid box exists;
         # otherwise fall through to the proxy / external-score layers below so we
@@ -1407,6 +1456,7 @@ def compute_reward_vector(
     answer_judge_dry_run: bool = True,
     force_answer_judge: bool = False,
     problem: Optional[str] = None,
+    reward_config: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Compute the five-dimensional reward vector for one trajectory.
 
@@ -1415,7 +1465,7 @@ def compute_reward_vector(
         If ``include_details=True``, also includes ``reward_details``.
     """
     # Answer — same definition as the live reward: per-field when configured.
-    _cfg = _active_reward_config()
+    _cfg = reward_config or _active_reward_config()
     exact_match = answer_reward(completion, solution)
     answer_mode = _cfg.answer_cfg["mode"]
     if answer_mode == "structured_fields":
@@ -1476,6 +1526,7 @@ def compute_reward_vector(
         reference_reasoning=reference_reasoning,
         reference_reasoning_steps=reference_reasoning_steps,
         task_metadata=task_metadata,
+        process_config=_cfg.process_cfg,
     )
 
     # Grounding (returns tuple now)
@@ -1485,6 +1536,7 @@ def compute_reward_vector(
         predicted_evidence_boxes=predicted_evidence_boxes,
         box_format=box_format,
         task_metadata=task_metadata,
+        grounding_config=_cfg.grounding_cfg,
         completion=completion,
     )
 
@@ -1593,10 +1645,18 @@ def compute_reward_vector(
             },
             "process": {
                 "score": process_val,
-                "source_type": "rule_based",
-                "reason": f"process_source={process_details.get('process_source')} "
-                          "(reference-step coverage + causal structure + shortcut; "
-                          "lexical/rule-based, no LLM judge)",
+                "source_type": (
+                    "metadata_based" if _cfg.process_cfg["mode"] == "visual_facts"
+                    else "rule_based"
+                ),
+                "reason": (
+                    "scene-metadata-verified attribute transitions blended with "
+                    "rule-based reasoning structure"
+                    if _cfg.process_cfg["mode"] == "visual_facts"
+                    else f"process_source={process_details.get('process_source')} "
+                         "(reference-step coverage + causal structure + shortcut; "
+                         "lexical/rule-based, no LLM judge)"
+                ),
                 **process_details,
             },
             "grounding": {
@@ -1637,6 +1697,7 @@ def compute_group_reward_vectors(
     answer_judge_force: bool = False,
     answer_judge_sample_n: int = 0,
     problem: Optional[str] = None,
+    reward_config: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     """Compute reward vectors for multiple trajectories of the same task.
 
@@ -1651,8 +1712,28 @@ def compute_group_reward_vectors(
     n = len(completions)
 
     # Consistency (multi-trajectory)
-    if _active_reward_config().consistency_cfg["mode"] == "field_consistency":
-        _fc = [field_consistency_reward(c) for c in completions]
+    active_cfg = reward_config or _active_reward_config()
+    if active_cfg.consistency_cfg["mode"] == "field_consistency":
+        # Match the live scorer's box parser. In particular, CLEVR boxes are
+        # pixel coordinates; parsing them as normalized [0,1] made offline
+        # consistency disagree with the reward used for GRPO.
+        from open_r1.self_evolve.grounding_iou import parse_evidence_boxes
+
+        meta = task_metadata or {}
+        _fc = []
+        for completion in completions:
+            parsed = parse_evidence_boxes(
+                completion,
+                image_width=int(meta.get("image_width") or 320),
+                image_height=int(meta.get("image_height") or 240),
+                valid_player_ids=meta.get("valid_player_ids"),
+                coordinate_mode=active_cfg.grounding_cfg["coordinate_mode"],
+            )
+            _fc.append(field_consistency_reward(
+                completion,
+                boxes=parsed["boxes_normalized"],
+                players=parsed["players"],
+            ))
         consistency_scores = [x[0] for x in _fc]
         consistency_details = [x[1] for x in _fc]
     else:
@@ -1701,6 +1782,7 @@ def compute_group_reward_vectors(
             answer_judge_dry_run=answer_judge_dry_run,
             force_answer_judge=force_judge,
             problem=problem,
+            reward_config=active_cfg,
         )
         reward_vectors.append(rv)
 

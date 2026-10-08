@@ -22,6 +22,8 @@ No API calls, no model loading, no training.
 from __future__ import annotations
 
 import json
+import math
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +36,7 @@ from open_r1.self_evolve.task_difficulty import (
 )
 from open_r1.self_evolve.task_editor import (
     build_variant,
+    changed_attribute_count,
     counterfactual_pairs,
     enumerate_variants,
 )
@@ -56,6 +59,30 @@ SPY_PLAYER_PROMPT = (
     "{image_width} pixels wide and {image_height} pixels high, with x1<x2 and "
     "y1<y2. At least one <bbox> tag is REQUIRED."
 )
+
+
+def _spy_player_prompt(num_players: int, image_width: int, image_height: int) -> str:
+    """Build the solver prompt, optionally requesting verifiable visual facts."""
+    prompt = SPY_PLAYER_PROMPT.format(
+        num_players=num_players, image_width=image_width, image_height=image_height,
+    )
+    if os.environ.get("SELF_EVOLVE_VISUAL_FACTS") != "1":
+        return prompt
+
+    answer_line = "<answer>spy=the player number; changed_attributes=the total count</answer>"
+    prompt = prompt.replace(
+        answer_line,
+        "<change>attribute:before->after</change>\n" + answer_line,
+        1,
+    )
+    return (
+        prompt
+        + " After all <bbox> tags and before <answer>, output exactly one "
+        "<change>attribute:before->after</change> for every changed attribute "
+        "of every changed object. Set attribute to color, shape, size, or "
+        "material; before is its value in the ordinary players' images and "
+        "after is its value in the spy's image. Omit unchanged attributes."
+    )
 
 _ATTRS = ("color", "shape", "size", "material")
 
@@ -299,18 +326,39 @@ class PolicyControlledCLEVRGenerator:
             pairs = counterfactual_pairs(subsets)
             if not pairs:
                 continue
+            if seed.get("direction") == "hold":
+                keep = seed.get("keep_indices")
+                if (not isinstance(keep, list) or not keep
+                        or any(type(i) is not int or i < 0 for i in keep)
+                        or len(set(keep)) != len(keep)):
+                    continue
+                keep_tuple = tuple(sorted(keep))
+                matching = [(small, large) for small, large in pairs
+                            if tuple(small) == keep_tuple or tuple(large) == keep_tuple]
+                if not matching:
+                    continue
+                small, large = matching[rng.randrange(len(matching))]
+                primary, other = ((small, large) if tuple(small) == keep_tuple
+                                  else (large, small))
+                num_players = seed.get("num_players") or self.config.num_players
+                if type(num_players) is not int or not 2 <= num_players <= 8:
+                    continue
+            else:
+                small, large = pairs[rng.randrange(len(pairs))]
+                harder = seed.get("direction") == "harder"
+                primary, other = (large, small) if harder else (small, large)
+                num_players = self.config.num_players
             seen_scenes.add(scene_id)
-            small, large = pairs[rng.randrange(len(pairs))]
             pair_id = f"{scene_id}::{'-'.join(map(str, small))}|{'-'.join(map(str, large))}"
-            spy_player = rng.randrange(self.config.num_players) + 1
-            harder = seed.get("direction") == "harder"
-            primary, other = (large, small) if harder else (small, large)
+            spy_player = rng.randrange(num_players) + 1
             plans.append({"scene_id": scene_id, "keep": primary, "pair_id": pair_id,
                           "pair_role": "large" if primary is large else "small",
+                          "num_players": num_players,
                           "spy_player": spy_player, "seed_regret": seed.get("regret")})
             if self.config.counterfactual_pairs:
                 plans.append({"scene_id": scene_id, "keep": other, "pair_id": pair_id,
                               "pair_role": "small" if primary is large else "large",
+                              "num_players": num_players,
                               "spy_player": spy_player, "seed_regret": seed.get("regret")})
         return plans
 
@@ -325,43 +373,46 @@ class PolicyControlledCLEVRGenerator:
 
         Each proposal is its own task, so a scene's group of proposals becomes
         that scene's group of tasks — the solver budget is unchanged, we only
-        moved who chooses. Proposals from one scene share a spy slot so they
-        stay comparable with each other.
+        moved who chooses. Proposals from one scene with the same player count
+        share a spy slot so their one-object contrasts stay comparable.
         """
         exclude = set(exclude_scene_ids or ())
-        spy_by_scene: Dict[str, int] = {}
+        spy_by_scene_and_players: Dict[tuple[str, int], int] = {}
         plans: List[Dict[str, Any]] = []
-        # A variant's task_id is derived from (scene, kept subset), so two
-        # proposals that picked the same subset would collide into one task_id:
-        # their rollouts would merge into a single oversized group and the pass
-        # rate would be computed over the wrong set. The action space is small,
-        # so duplicate picks are common — keep the first, drop the rest.
-        seen_subsets: set = set()
+        # The proposer controls both the kept subset and player count. Only
+        # identical choices are duplicates; different player counts produce
+        # different prompts and image lists for the same visual variant.
+        seen_choices: set = set()
         for proposal in proposals:
             if len(plans) >= budget:
                 break
+            if not isinstance(proposal, dict):
+                continue
             scene_id = proposal.get("scene_id")
             keep = proposal.get("keep")
-            if not scene_id or not keep or scene_id in exclude:
+            if (not isinstance(scene_id, str) or not scene_id or scene_id in exclude
+                    or not isinstance(keep, (list, tuple)) or not keep
+                    or any(type(index) is not int or index < 0 for index in keep)
+                    or len(set(keep)) != len(keep)):
                 continue
-            scene_id = str(scene_id)
-            subset_key = (scene_id, tuple(sorted(keep)))
-            if subset_key in seen_subsets:
+            players = proposal.get("num_players", self.config.num_players)
+            if type(players) is not int or not 2 <= players <= 8:
                 continue
-            seen_subsets.add(subset_key)
-            players = int(proposal.get("num_players") or self.config.num_players)
-            if scene_id not in spy_by_scene:
+            choice_key = (scene_id, tuple(sorted(keep)), players)
+            if choice_key in seen_choices:
+                continue
+            seen_choices.add(choice_key)
+            spy_key = (scene_id, players)
+            if spy_key not in spy_by_scene_and_players:
                 # The spy slot is drawn here, never taken from the proposal: it
                 # IS the answer, so a proposer that could pick it would let both
                 # roles settle on one constant slot and call it a win.
-                spy_by_scene[scene_id] = rng.randrange(players) + 1
-            if spy_by_scene[scene_id] > players:
-                spy_by_scene[scene_id] = rng.randrange(players) + 1
+                spy_by_scene_and_players[spy_key] = rng.randrange(players) + 1
             plans.append({
                 "scene_id": scene_id,
                 "keep": list(keep),
-                "num_players": proposal.get("num_players"),
-                "spy_player": spy_by_scene[scene_id],
+                "num_players": players,
+                "spy_player": spy_by_scene_and_players[spy_key],
                 "proposal_id": proposal.get("proposal_id"),
                 "pair_id": proposal.get("pair_id"),
                 "pair_role": proposal.get("pair_role"),
@@ -405,7 +456,12 @@ class PolicyControlledCLEVRGenerator:
         """Turn one edit plan into a candidate task with an exact gold answer."""
         scene_id = str(plan["scene_id"])
         from_proposer = plan.get("source") == "proposer"
-        source = "self_play_variant" if from_proposer else "regret_seeded_variant"
+        from_bootstrap = plan.get("source") == "bootstrap"
+        source = (
+            "self_play_variant" if from_proposer else
+            "bootstrap_counterfactual_variant" if from_bootstrap else
+            "regret_seeded_variant"
+        )
         scene = self._load_scene(scene_id)
         if not scene:
             return None
@@ -419,10 +475,8 @@ class PolicyControlledCLEVRGenerator:
         # A proposed task can ask for its own number of players, so its prompt
         # has to state that number rather than the generator-wide default.
         if num_players != self.config.num_players:
-            prompt = SPY_PLAYER_PROMPT.format(
-                num_players=num_players,
-                image_width=self.config.image_width,
-                image_height=self.config.image_height,
+            prompt = _spy_player_prompt(
+                num_players, self.config.image_width, self.config.image_height,
             )
         image_path = [
             variant["spy_image_path"] if (p + 1) == spy_player else variant["civilian_image_path"]
@@ -437,6 +491,10 @@ class PolicyControlledCLEVRGenerator:
             kept_mod, num_scene_objects=len(objects) if isinstance(objects, list) else None
         )
         task_id = f"{self.config.iteration_id}::{variant['variant_id']}"
+        if from_proposer:
+            # The same spliced image may be proposed with different numbers of
+            # players. Keep their rollout groups and pass rates separate.
+            task_id += f"__players{num_players}"
         return {
             "task_id": task_id,
             "base_task_id": variant["variant_id"],
@@ -455,6 +513,8 @@ class PolicyControlledCLEVRGenerator:
             "generation_reason": (
                 f"proposed from {scene_id} (keep={plan['keep']})"
                 if from_proposer else
+                f"bootstrap pair from {scene_id} (keep={plan['keep']})"
+                if from_bootstrap else
                 f"edited from {scene_id} (keep={plan['keep']}, "
                 f"seed_regret={plan.get('seed_regret')})"
             ),
@@ -483,6 +543,59 @@ class PolicyControlledCLEVRGenerator:
             },
             "evidence_schema": "clevr_scene_metadata_replaced_objects",
         }
+
+    def _bootstrap_counterfactual_tasks(
+        self,
+        scene_ids: List[str],
+        rng: random.Random,
+        prompt: str,
+        policy_version: int,
+        slot_budget: int,
+    ) -> List[Dict[str, Any]]:
+        """Build easy/hard contrasts from new scenes when no solved seeds exist.
+
+        The pair shares the same scene, prompt, player count and spy slot; the
+        large member keeps exactly one more changed object. This gives the
+        first round (or an all-failed round) visually resolvable count changes
+        without relying on a previous solver to find a regret seed.
+        """
+        if slot_budget < 2 or not self.config.counterfactual_pairs:
+            return []
+        candidates = list(scene_ids)
+        rng.shuffle(candidates)
+        tasks: List[Dict[str, Any]] = []
+        for scene_id in candidates:
+            if len(tasks) + 2 > slot_budget:
+                break
+            scene = self._load_scene(scene_id)
+            replaced = (scene.get("modification") or {}).get("replaced_objects") if scene else None
+            if not isinstance(replaced, list) or len(replaced) < 2:
+                continue
+            objects = (scene.get("original_scene") or {}).get("objects")
+            clutter = len(objects) if isinstance(objects, list) else None
+            options = [i for i, obj in enumerate(replaced)
+                       if isinstance(obj, dict) and changed_attribute_count(obj) > 0]
+            if len(options) < 2:
+                continue
+            # Choose the most visible edits, independent of their labels.
+            ranked = sorted(options, key=lambda i: (
+                estimate_difficulty(
+                    {"replaced_objects": [replaced[i]]}, num_scene_objects=clutter
+                )["difficulty_score"], -i
+            ), reverse=True)
+            small, large = [ranked[0]], sorted(ranked[:2])
+            pair_id = f"{scene_id}::bootstrap::{ranked[0]}|{'-'.join(map(str, large))}"
+            spy = rng.randrange(self.config.num_players) + 1
+            plans = [
+                {"scene_id": scene_id, "keep": small, "source": "bootstrap",
+                 "pair_id": pair_id, "pair_role": "small", "spy_player": spy},
+                {"scene_id": scene_id, "keep": large, "source": "bootstrap",
+                 "pair_id": pair_id, "pair_role": "large", "spy_player": spy},
+            ]
+            built = self._build_variant_tasks(plans, prompt, policy_version)
+            if len(built) == 2:
+                tasks.extend(built)
+        return tasks
 
     # -- main generation ----------------------------------------------------
 
@@ -529,17 +642,42 @@ class PolicyControlledCLEVRGenerator:
 
         # Edited variants of last round's seed scenes take the first slots;
         # the rest of the round is sampled fresh.
-        prompt = SPY_PLAYER_PROMPT.format(
-            num_players=self.config.num_players,
-            image_width=self.config.image_width,
-            image_height=self.config.image_height,
+        prompt = _spy_player_prompt(
+            self.config.num_players, self.config.image_width, self.config.image_height,
         )
         edit_plan = self._plan_edits(editing_policy, rng, exclude_scene_ids, proposals)
         variant_tasks = self._build_variant_tasks(edit_plan, prompt, policy_version)
+        used_variant_scenes = {t["scene_id"] for t in variant_tasks}
+        # First-round collapse is common: without a solved seed, all edits
+        # otherwise disappear and every task comes from the unedited pool. In
+        # the optional visual-facts experiment, reserve a small fixed share of
+        # slots for contrasts that differ by one visible object.
+        bootstrap_tasks: List[Dict[str, Any]] = []
+        if not (editing_policy.get("seeds") or []):
+            raw_fraction = os.environ.get("SELF_EVOLVE_BOOTSTRAP_PAIR_FRACTION", "0")
+            try:
+                fraction = float(raw_fraction)
+            except ValueError as exc:
+                raise ValueError("SELF_EVOLVE_BOOTSTRAP_PAIR_FRACTION must be in [0, 1]") from exc
+            if not math.isfinite(fraction) or not 0.0 <= fraction <= 1.0:
+                raise ValueError("SELF_EVOLVE_BOOTSTRAP_PAIR_FRACTION must be in [0, 1]")
+            slot_budget = min(
+                int(self.config.num_tasks * fraction),
+                self.config.num_tasks - len(variant_tasks),
+            )
+            if slot_budget >= 2:
+                available = [bn for lvl in ("easy", "medium", "hard")
+                             for bn in buckets[lvl]
+                             if bn not in exclude_scene_ids and bn not in used_variant_scenes]
+                bootstrap_tasks = self._bootstrap_counterfactual_tasks(
+                    available, rng, prompt, policy_version, slot_budget
+                )
         # Fresh sampling fills whatever the (possibly failed) edits left open,
         # and never re-proposes a scene the edits already used.
-        exclude_scene_ids |= {t["scene_id"] for t in variant_tasks}
-        num_fresh = max(0, self.config.num_tasks - len(variant_tasks))
+        exclude_scene_ids |= {t["scene_id"] for t in variant_tasks + bootstrap_tasks}
+        for lvl in buckets:
+            buckets[lvl] = [bn for bn in buckets[lvl] if bn not in exclude_scene_ids]
+        num_fresh = max(0, self.config.num_tasks - len(variant_tasks) - len(bootstrap_tasks))
         alloc = self._allocation(num_fresh, distribution)
 
         # Difficulty decides how hard the task is; label balancing decides what
@@ -567,16 +705,28 @@ class PolicyControlledCLEVRGenerator:
             "selected_label_histogram": _histogram(
                 [label_of(bn) for bn, _ in chosen]
             ),
+            "selected_label_histogram_all": _histogram(
+                [label_of(bn) for bn, _ in chosen]
+                + [t["metadata"]["variant"]["num_attr_changes"]
+                   for t in variant_tasks + bootstrap_tasks]
+            ),
             "label_balance": self.config.label_balance,
             "difficulty_allocation": alloc,
-            "num_edited": len(variant_tasks),
+            "num_edited": len(variant_tasks) + len(bootstrap_tasks),
+            "num_bootstrap": len(bootstrap_tasks),
             "num_fresh": len(chosen),
             "num_counterfactual_pairs": sum(
-                1 for t in variant_tasks if t.get("pair_role") == "small"),
-            "edit_source": "proposer" if proposals else "regret_seeded",
+                1 for t in variant_tasks + bootstrap_tasks if t.get("pair_role") == "small"),
+            "edit_source": (
+                "proposer+bootstrap" if proposals and bootstrap_tasks else
+                "proposer" if proposals else
+                "regret_seeded+bootstrap" if variant_tasks and bootstrap_tasks else
+                "bootstrap" if bootstrap_tasks else
+                "regret_seeded"
+            ),
         }
 
-        candidates: List[Dict[str, Any]] = list(variant_tasks)
+        candidates: List[Dict[str, Any]] = list(variant_tasks) + bootstrap_tasks
         offset = len(candidates)
         for i, (bn, est_level) in enumerate(chosen, start=offset):
             scene = self._load_scene(bn)

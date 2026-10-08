@@ -19,24 +19,24 @@ set -euo pipefail
 # =============================================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REPO:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
-WORKSPACE="${WORKSPACE:-/jizhicfs/rtliu}"
+WORKSPACE="${WORKSPACE:-$REPO}"
 
 # --- conda 环境 ---
-CONDA_BASE="${CONDA_BASE:-/jizhicfs/rtliu/miniconda3}"
-CONDA_ENV="${CONDA_ENV:-sevlm}"
+CONDA_BASE="${CONDA_BASE:-}"
+CONDA_ENV="${CONDA_ENV:-easy-r1}"
 WANDB_PKG_DIR="${WANDB_PKG_DIR:-/tmp/sevlm_wandb_py311}"
-if [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
+if [ -n "$CONDA_BASE" ] && [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
   # shellcheck disable=SC1091
   source "$CONDA_BASE/etc/profile.d/conda.sh"
   conda activate "$CONDA_ENV"
-else
+elif [ -n "$CONDA_BASE" ]; then
   echo "[WARN] conda.sh not found at $CONDA_BASE (set CONDA_BASE if conda lives elsewhere)" >&2
 fi
-PY="${PY:-$CONDA_BASE/envs/$CONDA_ENV/bin/python}"
+PY="${PY:-$(command -v python3 || command -v python || true)}"
 if [ ! -x "$PY" ]; then
   PY="$(command -v python3 || command -v python || true)"
   [ -n "$PY" ] || { echo "[ERROR] no python found. Set PY=/path/to/python, or CONDA_BASE/CONDA_ENV." >&2; exit 2; }
-  echo "[WARN] conda env '$CONDA_ENV' not found; using $PY." >&2
+  echo "[WARN] requested Python is unavailable; using $PY." >&2
 fi
 
 # --- 数据 / 模型 / 输出 / reward ---
@@ -46,7 +46,7 @@ RUNS_ROOT="${RUNS_ROOT:-$WORKSPACE/self_evolve_runs}"
 # Dedicated baseline reward: parse the two answer fields, then return 1 only
 # when BOTH match gold.  Main-method / ablation reward JSON files are untouched.
 REWARD_JSON="${REWARD_JSON:-$REPO/local_scripts/self_evolve/configs/reward/baselines/grpo_binary_outcome.json}"
-# API key 放 .env（gitignored），或直接 export；shell 里已 export 的永远优先。
+# API key 从 .env 或环境变量读取。
 ENV_FILE="$REPO/.env"
 
 # --- 自动派生 ---
@@ -92,7 +92,7 @@ GRPO_MAX_PROMPT_LEN="${GRPO_MAX_PROMPT_LEN:-10240}"
 GRPO_MAX_COMPLETION_LEN="${GRPO_MAX_COMPLETION_LEN:-2048}"  # 对齐 ours（放得下五图 CoT + 尾部 <bbox>）
 GRPO_MIN_PIXELS="${GRPO_MIN_PIXELS:-602112}"            # 1024*28*28（4x）
 GRPO_MAX_PIXELS="${GRPO_MAX_PIXELS:-1003520}"           # 640*28*28
-GRPO_SCALE_REWARDS="${GRPO_SCALE_REWARDS:-False}"       # Dr.GRPO：减组均值不除 std
+GRPO_SCALE_REWARDS="${GRPO_SCALE_REWARDS:-False}"       # 减组均值，不除标准差
 GRPO_OVERLONG_FILTERING="${GRPO_OVERLONG_FILTERING:-True}"
 GRPO_DYNAMIC_SAMPLING="${GRPO_DYNAMIC_SAMPLING:-True}"
 GRPO_DYNAMIC_MODE="${GRPO_DYNAMIC_MODE:-mask_degenerate}"
@@ -178,7 +178,8 @@ if [ "${WANDB:-1}" = "1" ]; then
   export SELF_EVOLVE_REPORT_TO=wandb
   export WANDB_PROJECT="${WANDB_PROJECT:-self-evolve-vlm}"
   export WANDB_NAME="${WANDB_NAME:-base_grpo_${NUM_TRAIN_TASKS}t_${MAX_STEPS}step}"
-  export WANDB_API_KEY="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"
+  : "${WANDB_API_KEY:?WANDB=1 requires WANDB_API_KEY in the environment}"
+  export WANDB_API_KEY
   echo "[wandb] package=$WANDB_PKG_DIR"
   "$PY" -m wandb login --relogin "$WANDB_API_KEY" || {
     echo "[ERROR] W&B login failed; refusing to start an untracked training run." >&2

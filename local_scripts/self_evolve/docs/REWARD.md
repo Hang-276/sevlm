@@ -9,6 +9,34 @@ the current config on the fly, no separate file needed.
 
 ## How the reward is computed
 
+### Optional verified visual facts experiment
+
+`experiments/main/ours_visual_facts.sh` switches the process dimension to a
+verifiable attribute-change certificate. For every changed attribute, the
+solver emits `<change>color:purple->brown</change>` (the first value belongs to
+the common images, the second to the spy image). The gold multiset is built
+from each task's CLEVR scene and retained object indices. Process credit is
+75% multiset F1 over these claims and 25% of the existing structure score;
+wrong pairings, duplicate claims, malformed tags and omissions reduce it.
+The outcome gate still requires the spy answer to be correct. The experimental
+reward weights are in `configs/reward/reward_visual_facts.json`; the original
+`reward_weights.json` and prompt remain the default.
+Only trajectories with a complete fact certificate (`visual_facts_score=1`),
+plus the usual answer/box/format checks, enter the solver's positive replay
+buffer. Partial certificates can still provide graded GRPO signal.
+
+The experiment exports up to 64 deterministic, metadata-verified certificate
+examples per round for SFT. It also exports up to 64 single-image questions
+about the unedited scene: object count, left/right position, and depth order.
+The latter use unique object descriptions and large spatial margins to avoid
+ambiguous targets. These sources let SFT run even when no sampled solver
+trajectory qualifies for the positive buffer; proposer-only records still do
+not. Set `SELF_EVOLVE_ORACLE_SFT_MAX=0` and/or `SELF_EVOLVE_SCENE_QA_MAX=0` to
+ablate them. Scene metadata supplies reward and SFT targets, never the model
+prompt. The certificate checks which attributes changed, but does not yet bind
+each claim to a particular object box; the independent box-F1 dimension remains
+active.
+
 Weighted sum over five dimensions; the weights and what each dimension means
 all come from the reward config:
 

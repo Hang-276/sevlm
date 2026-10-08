@@ -1,8 +1,16 @@
 
-# ----------------------- Fix the flash attention bug in the current version of transformers -----------------------
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLVisionFlashAttention2, apply_rotary_pos_emb_flashatt, flash_attn_varlen_func
+from functools import wraps
+import inspect
+from transformers.models.qwen2_5_vl import modeling_qwen2_5_vl as qwen_modeling
+from transformers.utils import logging
 import torch
 from typing import Tuple, Optional
+
+logger = logging.get_logger(__name__)
+Qwen2_5_VLVisionFlashAttention2 = getattr(qwen_modeling, "Qwen2_5_VLVisionFlashAttention2", None)
+apply_rotary_pos_emb_flashatt = getattr(qwen_modeling, "apply_rotary_pos_emb_flashatt", None)
+flash_attn_varlen_func = getattr(qwen_modeling, "flash_attn_varlen_func", None)
+
 def qwen2_5vl_vision_flash_attn_forward(
         self,
         hidden_states: torch.Tensor,
@@ -41,7 +49,15 @@ def qwen2_5vl_vision_flash_attn_forward(
 
 
 def monkey_patch_qwen2_5vl_flash_attn():
+    if Qwen2_5_VLVisionFlashAttention2 is None:
+        if hasattr(qwen_modeling, "Qwen2_5_VLVisionAttention") and hasattr(qwen_modeling, "apply_rotary_pos_emb_vision"):
+            # Modern attention already computes vision rotary embeddings in fp32.
+            return False
+        raise RuntimeError("Unsupported Qwen2.5-VL vision attention implementation")
+    if apply_rotary_pos_emb_flashatt is None or flash_attn_varlen_func is None:
+        raise RuntimeError("Legacy Qwen2.5-VL Flash Attention dependencies are unavailable")
     Qwen2_5_VLVisionFlashAttention2.forward = qwen2_5vl_vision_flash_attn_forward
+    return True
 
 
 # ----------------------- Fix the process pending bug when using data mixture of image-text data and pure-text under deepseed zero3-----------------------
@@ -232,11 +248,41 @@ def qwen2_5vl_forward(
         )
 
 def monkey_patch_qwen2_5vl_forward():
+    if hasattr(qwen_modeling, "Qwen2_5_VLTextModel"):
+        model_class = qwen_modeling.Qwen2_5_VLModel
+        original = model_class.forward
+        if getattr(original, "_sevlm_modality_guard", False):
+            return False
+        signature = inspect.signature(original)
+
+        @wraps(original)
+        def homogeneous_forward(self, *args, **kwargs):
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                values = signature.bind_partial(self, *args, **kwargs).arguments
+                source = values.get("input_ids")
+                if source is None:
+                    source = values.get("inputs_embeds")
+                device = source.device if source is not None else next(self.parameters()).device
+                modalities = torch.tensor(
+                    [values.get("pixel_values") is not None, values.get("pixel_values_videos") is not None],
+                    device=device, dtype=torch.long,
+                )
+                torch.distributed.all_reduce(modalities, op=torch.distributed.ReduceOp.SUM)
+                world = torch.distributed.get_world_size()
+                if ((modalities != 0) & (modalities != world)).any():
+                    raise RuntimeError(
+                        "Qwen2.5-VL sharded training requires identical image/video presence across ranks per microbatch; "
+                        "mixed image/text ranks are unsupported on this Transformers architecture"
+                    )
+            return original(self, *args, **kwargs)
+
+        homogeneous_forward._sevlm_modality_guard = True
+        model_class.forward = homogeneous_forward
+        return True
     Qwen2_5_VLForConditionalGeneration.forward = qwen2_5vl_forward
+    return True
 
 # ----------------------- Set the Weights only as False in torch.load (In Pytorch 2.6, this is default as True)-----------------------
-from deepspeed.runtime.checkpoint_engine.torch_checkpoint_engine import TorchCheckpointEngine
-from deepspeed.utils import logger, log_dist
 def weigths_only_load(self, path: str, map_location=None):
     logger.info(f"[Torch] Loading checkpoint from {path}...")
     partition = torch.load(path, map_location=map_location, weights_only=False)
@@ -244,7 +290,14 @@ def weigths_only_load(self, path: str, map_location=None):
     return partition
 
 def monkey_patch_torch_load():
+    try:
+        from deepspeed.runtime.checkpoint_engine.torch_checkpoint_engine import TorchCheckpointEngine
+    except ModuleNotFoundError as exc:
+        if exc.name != "deepspeed":
+            raise
+        return False
     TorchCheckpointEngine.load = weigths_only_load
+    return True
 
 
 # ----------------------- DeepSpeed ZeRO-3 bf16 non-finite-grad skip -----------------------
@@ -302,6 +355,5 @@ def monkey_patch_deepspeed_bf16_nan_skip():
         _patched_overflow_check_and_loss_scale_update
     )
     DeepSpeedZeroOptimizer_Stage3._bf16_nan_skip_patched = True
-
 
 

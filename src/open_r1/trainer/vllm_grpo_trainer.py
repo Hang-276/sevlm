@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import os
-import textwrap
 from collections import defaultdict
 from typing import Any, Callable, Optional, Union
 from accelerate.utils.other import is_compiled_module
@@ -73,6 +72,7 @@ if is_wandb_available():
     import wandb
 import torch.nn as nn
 from torch.utils.data import Sampler
+from open_r1.qwen_pixels import configure_qwen_image_pixels
 
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
@@ -226,8 +226,7 @@ class Qwen2VLGRPOVLLMTrainer(Trainer):
                 processing_class.pad_token_id = pad_token_id
                 processing_class.eos_token_id = processing_class.tokenizer.eos_token_id
                 if "Qwen" in model_id or "Qwen2.5-VL" in model_id:
-                    processing_class.image_processor.max_pixels = max_pixels
-                    processing_class.image_processor.min_pixels = min_pixels
+                    configure_qwen_image_pixels(processing_class, min_pixels, max_pixels)
             else:
                 processing_class = AutoTokenizer.from_pretrained(
                     model.config._name_or_path, padding_side="left"
@@ -279,10 +278,8 @@ class Qwen2VLGRPOVLLMTrainer(Trainer):
 
         # Training arguments
         self.max_prompt_length = args.max_prompt_length
-        self.max_completion_length = (
-            args.max_completion_length
-        )  # = |o_i| in the GRPO paper
-        self.num_generations = args.num_generations  # = G in the GRPO paper
+        self.max_completion_length = args.max_completion_length
+        self.num_generations = args.num_generations
         self.generation_config = GenerationConfig(
             max_new_tokens=self.max_completion_length,
             do_sample=True,

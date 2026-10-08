@@ -1,20 +1,4 @@
-"""Zero-dependency .env loader for the self-evolve loop.
-
-Why this exists
----------------
-A reusable, open-source-grade project must support a ``.env`` file so users can
-supply credentials (e.g. the Reference VLM API key) without exporting them by
-hand every session. This loader keeps that ergonomic while staying safe:
-
-  - It loads ``KEY=VALUE`` lines into ``os.environ`` ONLY if the key is not
-    already set (real environment / ``read -s`` always wins).
-  - It NEVER prints values.
-  - The ``.env`` file itself is gitignored (see repo ``.gitignore``) and is
-    never written by this code — only read. A committed ``.env.example`` holds
-    placeholders, never real secrets.
-
-No third-party dependency (python-dotenv is not required).
-"""
+"""Load local .env values without replacing exported environment variables."""
 
 from __future__ import annotations
 
@@ -26,34 +10,20 @@ from typing import List, Optional
 def _candidate_paths(explicit: Optional[str]) -> List[Path]:
     if explicit:
         return [Path(explicit)]
-    # Search cwd upward to the git repo root for a .env file.
+    # Stop at the project root even when Git metadata has been removed.
     here = Path.cwd()
-    candidates = [here / ".env"]
-    for parent in here.parents:
-        candidates.append(parent / ".env")
-        if (parent / ".git").exists():
+    candidates = []
+    for directory in (here, *here.parents):
+        candidates.append(directory / ".env")
+        if (directory / ".git").exists() or (
+            (directory / "setup.py").is_file() and (directory / "src/open_r1").is_dir()
+        ):
             break
     return candidates
 
 
 def load_dotenv(path: Optional[str] = None, override: bool = False) -> List[str]:
-    """Load a ``.env`` file into ``os.environ``.
-
-    Parameters
-    ----------
-    path : str or None
-        Explicit path to a ``.env`` file. When None, searches cwd upward to the
-        repo root.
-    override : bool
-        When False (default), existing environment variables are preserved — a
-        key exported via ``read -s`` or the shell always takes precedence over
-        the file. When True, file values overwrite.
-
-    Returns
-    -------
-    list[str]
-        The names (NOT values) of the keys that were loaded. Safe to print/log.
-    """
+    """Load the first local .env file and return the names of imported keys."""
     loaded: List[str] = []
     for candidate in _candidate_paths(path):
         if not candidate.is_file():

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Experiment 3: official Vision-Zero implementation with sevlm-aligned settings.
+# External baseline with aligned experiment settings.
 # Does not source sevlm paths.sh, common.sh, train_defaults.sh or .env.
 # Setup and evaluation: ../VISION_ZERO.md. DRY_RUN=1 only prints the command.
 set -euo pipefail

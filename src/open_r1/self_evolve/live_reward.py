@@ -12,6 +12,7 @@ the fallback is recorded in the breakdown.
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import threading
@@ -30,6 +31,7 @@ from open_r1.self_evolve.rewards import (
     is_format_valid,
 )
 from open_r1.self_evolve.reward_config import load_reward_config, RewardConfig
+from open_r1.self_evolve.verified_qa_reward import VERIFIED_COUNT_QA, score_verified_count_qa
 
 _REWARD_CONFIG_ENV = "SELF_EVOLVE_REWARD_CONFIG"
 
@@ -94,11 +96,13 @@ def _live_grounding(
     g = g if isinstance(g, dict) else {}
 
     gold_boxes = g.get("gold_evidence_boxes")
-    image_width = int(g.get("image_width") or 320)
-    image_height = int(g.get("image_height") or 240)
+    image_width = g.get("image_width", 320)
+    image_height = g.get("image_height", 240)
+    valid_size = all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                     and math.isfinite(value) and value > 0 for value in (image_width, image_height))
+    if not valid_size:
+        image_width, image_height, gold_boxes = 320, 240, None
     valid_player_ids = g.get("valid_player_ids")
-    if not isinstance(valid_player_ids, list) or not valid_player_ids:
-        valid_player_ids = None
 
     fields = score_model_bbox_grounding(
         completion,
@@ -109,6 +113,11 @@ def _live_grounding(
         config=cfg.grounding_cfg if cfg is not None else None,
     )
     score = float(fields["grounding_reward"])
+    if not valid_size:
+        score = fields["grounding_reward"] = 0.0
+        fields["grounding_reward_components"] = {"format": 0.0, "player_id": 0.0, "iou": 0.0}
+        fields["grounding_reward_source"] = "invalid_grounding_metadata"
+        fields["bbox_invalid_reason"] = "invalid_image_size"
     # grounding_source is an alias kept for existing log consumers.
     fields["grounding_source"] = fields["grounding_reward_source"]
     fields["fallback"] = fields["grounding_reward_source"] != "model_bbox_iou"
@@ -165,6 +174,23 @@ def self_evolve_refined_reward(completions, **kwargs) -> List[float]:
         se = se if isinstance(se, dict) else {}
         prob = problems[i] if i < len(problems) else None
 
+        if se.get("task_kind") == VERIFIED_COUNT_QA:
+            total, details = score_verified_count_qa(comp, sol, se)
+            if cfg.control_mode == "random":
+                total = random.random()
+            elif cfg.control_mode == "format_only":
+                total = float(details["format_valid"])
+            rewards.append(float(total))
+            breakdowns.append({
+                **details,
+                "reward_scalar_used": float(total),
+                "reward_config_path": cfg.path,
+                "reward_config_version": cfg.version,
+                "control_mode": cfg.control_mode,
+                "training_step": _training_step,
+            })
+            continue
+
         gold = _gold_answer(sol)
         sol_text = sol if isinstance(sol, str) else f"<answer>{gold}</answer>"
 
@@ -190,9 +216,14 @@ def self_evolve_refined_reward(completions, **kwargs) -> List[float]:
 
         # Reference block supplies budget / reference steps when present.
         ref_block = se.get("reference") if isinstance(se.get("reference"), dict) else {}
-        task_meta = dict(se.get("task_metadata") or {})
+        task_meta = dict(se["task_metadata"]) if isinstance(se.get("task_metadata"), dict) else {}
+        fact_block = se.get("visual_facts") if isinstance(se.get("visual_facts"), dict) else {}
+        task_meta["gold_visual_changes"] = fact_block.get("gold_visual_changes") or []
         if ref_block.get("reasoning_budget_steps") is not None:
             task_meta.setdefault("reasoning_budget_steps", ref_block["reasoning_budget_steps"])
+            task_meta["budget_source"] = ref_block.get("reference_source", "reference_block")
+        if ref_block.get("reasoning_budget_tokens") is not None:
+            task_meta.setdefault("reasoning_budget_tokens", ref_block["reasoning_budget_tokens"])
             task_meta["budget_source"] = ref_block.get("reference_source", "reference_block")
         b, b_det = budget_reward(
             comp,
@@ -206,6 +237,7 @@ def self_evolve_refined_reward(completions, **kwargs) -> List[float]:
             reference_reasoning=ref_reasoning,
             reference_reasoning_steps=ref_steps,
             task_metadata=task_meta,
+            process_config=cfg.process_cfg,
         )
         g, g_det = _live_grounding(comp, se, cfg)
         warmup = int(cfg.grounding_cfg.get("warmup_steps", 0) or 0)
@@ -236,7 +268,8 @@ def self_evolve_refined_reward(completions, **kwargs) -> List[float]:
         }
         # The only training scalar: weighted sum after the outcome gate.
         total = cfg.scalarize(
-            reward_vector, spy_correct=spy_correct, answer_correct=exact >= 1.0
+            reward_vector, spy_correct=spy_correct, answer_correct=exact >= 1.0,
+            format_valid=f,
         )
         # Control exps: replace the scalar with a signal that says nothing about
         # correctness. Only for the attribution baselines, never for a real run.
@@ -247,6 +280,7 @@ def self_evolve_refined_reward(completions, **kwargs) -> List[float]:
         gate = cfg.gate_factor(spy_correct=spy_correct, answer_correct=exact >= 1.0)
         rewards.append(float(total))
         breakdowns.append({
+            "task_kind": "clevr_spy",
             "answer": round(a, 4), "budget": round(b, 4), "process": round(p, 4),
             "grounding": round(g, 4), "consistency": round(c, 4),
             "format_valid": bool(f),
@@ -265,7 +299,12 @@ def self_evolve_refined_reward(completions, **kwargs) -> List[float]:
             "gold_changed_attributes": gold_fields.get("changed_attributes"),
             "spy_correct": spy_correct,
             "num_pred_boxes": len(g_det.get("predicted_bbox_norm") or []),
+            "visual_facts_score": p_det.get("visual_facts_score"),
+            "visual_facts": p_det.get("visual_facts"),
             "gate_factor": gate,
+            "format_gate_factor": (
+                0.0 if cfg.process_cfg["require_valid_format_for_aux"] and not f else 1.0
+            ),
             "control_mode": cfg.control_mode,
             "grounding_active": grounding_active,
             "training_step": _training_step,

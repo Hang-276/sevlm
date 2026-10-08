@@ -29,6 +29,8 @@ E=local_scripts/self_evolve/experiments
 | base + GRPO | `main/grpo_baseline.sh` |
 | base + vision-zero (official implementation, aligned settings) | `main/vision_zero_baseline.sh` — [separate setup](VISION_ZERO.md) |
 | base + ours | `main/ours.sh` |
+| base + ours + verified visual facts (experimental) | `main/ours_visual_facts.sh` |
+| base + visual facts + visual curriculum (experimental) | `main/ours_visual_curriculum.sh` — [research and ablations](VISUAL_CURRICULUM.md) |
 | base + ours w/o self-play | `main/ours_no_self_play.sh` |
 | base + ours w/o process reward | `main/ours_no_process.sh` |
 
@@ -49,22 +51,89 @@ the launcher aligns total GRPO steps and common settings with
 `main/ours.sh` now shares that RL budget; `VISION_ZERO_PROTOCOL=main_ours`
 is retained as an alias with the same defaults. Neither profile equates total generated
 tokens/FLOPs across the two methods. See [EVAL_DATASETS.md](EVAL_DATASETS.md)
-for the actual 6-benchmark versus 10-benchmark evaluation entry points.
+for the shared nine-benchmark evaluation entry point and dataset names.
 
 `ours_no_self_play` is the row that says what the proposing side is worth:
 the model still solves everything, but a regret heuristic picks the edits
 instead of the model proposing them. Nothing else changes.
 
+`main/ours_visual_facts.sh` is a separate experimental extension, not a row
+of the original main table. It asks the solver for one
+`<change>attribute:before->after</change>` tag per changed attribute and checks
+those tags against the exact CLEVR scene metadata using multiset F1. Extra,
+repeated and malformed tags cost precision. In this experiment, a malformed
+completion receives answer/budget credit but no grounding, process, or
+consistency credit, matching the positive-buffer format requirement.
+A capped, deterministic SFT set of
+verified certificates teaches the new syntax before GRPO. A second capped SFT
+source asks count, left/right and depth questions about the unedited civilian
+image, with answers computed from its original CLEVR scene. Each source defaults
+to at most 64 records per round; set `SELF_EVOLVE_ORACLE_SFT_MAX=0` and
+`SELF_EVOLVE_SCENE_QA_MAX=0` to disable them independently. In rounds with
+real solver positives, `SELF_EVOLVE_AUX_SFT_MAX_RATIO=1.0` caps the combined
+auxiliary count at the real-positive count, splitting slots between the two
+sources when possible. A zero-positive round keeps both pools for cold start;
+set the ratio to `0` to remove auxiliaries once positives appear, or unset it
+to recover the uncapped export. Whenever no solved editing seeds are available,
+the launcher reserves 25% of generated candidate-task slots for matched
+one-object/two-object task pairs via
+`SELF_EVOLVE_BOOTSTRAP_PAIR_FRACTION=0.25`; set it to `0` for an ablation.
+The script sets
+`SFT_MIN_PIXELS=401408` and `SFT_MAX_PIXELS=602112` (512–768 merged Qwen
+visual tokens per image) with `SFT_PER_DEVICE_BATCH=2`. GRPO uses at least
+1024 merged visual tokens per image; the SFT setting is deliberately smaller because a batch
+can contain several player images and full-parameter SFT has a different
+memory footprint. On hardware with headroom, test matching GRPO's image scale
+by overriding these two SFT variables, while lowering the batch if needed.
+The shared SFT defaults remain unchanged for the original main experiments.
+It uses `configs/reward/reward_visual_facts.json` and leaves `main/ours.sh`
+unchanged. For attribution, compare against `main/ours.sh` at the same
+backbone, task budget, GRPO steps and evaluation settings. The loop records a
+code, reward, and run-settings fingerprint. Resume into an
+older or changed run directory is refused; use a fresh `RUN_TAG` for this
+version so old scored trajectories and checkpoints cannot be silently reused.
+The following controls use the same launcher; assign each one a distinct
+`RUN_TAG` and `MARKER`, and use a matching unique `LABEL` when evaluating:
+
+| control | launcher overrides | what it isolates |
+|---|---|---|
+| no bootstrap pairs | `SELF_EVOLVE_BOOTSTRAP_PAIR_FRACTION=0` | effect of task pairing when no solved editing seeds are available |
+| no auxiliary SFT | `SELF_EVOLVE_ORACLE_SFT_MAX=0 SELF_EVOLVE_SCENE_QA_MAX=0` | certificate prompt plus verified reward without synthetic SFT |
+| no auxiliary SFT after cold start | `SELF_EVOLVE_AUX_SFT_MAX_RATIO=0` | synthetic SFT in later rounds, preserving first-round cold start |
+| prompt only | `REWARD_JSON="$PWD/local_scripts/self_evolve/configs/reward/reward_weights.json" SELF_EVOLVE_ORACLE_SFT_MAX=0 SELF_EVOLVE_SCENE_QA_MAX=0 SELF_EVOLVE_BOOTSTRAP_PAIR_FRACTION=0` | certificate instructions under the original reward |
+| reward only | `SELF_EVOLVE_VISUAL_FACTS=0 SELF_EVOLVE_BOOTSTRAP_PAIR_FRACTION=0` | verified reward without certificate instructions or auxiliary SFT; this is a hard exploration control because tags are not requested |
+
+The new SFT image scale and batch apply to these controls too. For strict
+comparison to `main/ours.sh`, pass the same `SFT_MIN_PIXELS`, `SFT_MAX_PIXELS`
+and `SFT_PER_DEVICE_BATCH` there as well. These scores are new experiments,
+not established improvements.
+
+`main/ours_visual_curriculum.sh` adds paired single-image count QA, joint
+visual-evidence mastery, and fixed-denominator Dr. GRPO loss. It preserves the
+GRPO prompt count and existing game pairs. See [VISUAL_CURRICULUM.md](VISUAL_CURRICULUM.md)
+for the paper survey, exact settings, ablations and performance limits.
+
+The SFT loader preserves the full multi-image prompt and answer. It skips
+TRL's generic dataset tokenization and sets `max_length=None`; the 1024-token
+text default would otherwise cut 5–8-image examples before the answer.
+
+For the nine requested benchmarks, evaluate every full checkpoint with the
+same explicit dataset list and decoding settings (`MMStar` is the evaluator's
+name for MMStar):
+
+```bash
+DATASETS="MMVP MMStar BLINK RealWorldQA AI2D_TEST ChartQA_TEST MMMU_Pro_10c CV-Bench-2D CV-Bench-3D" \
+  LABEL=ours_visual_facts bash $E/analysis/eval_checkpoint.sh /path/to/full-checkpoint
+```
+
 `main/eval.sh` handles three kinds of directory: a self-evolve run (merges
 the final round's weights), a trainer output dir (picks the
 highest-numbered checkpoint), or a directory that already is a full model.
 
-`main/eval.sh` is the legacy shared entry; with no run_dir it uses the most
-recent recorded run (`MARKER=xxx` selects one). Experiments 1 and 3 now use
-the isolated `analysis/eval_checkpoint.sh` with explicit model paths and
-saved evaluation configs. Use the same explicit datasets, decoding and judge
-for all five rows;
-do not assume the legacy defaults equal the new evaluator's explicit settings.
+`main/eval.sh` delegates to the same `analysis/eval_checkpoint.sh` protocol.
+With no run directory, it uses the most recent recorded run (`MARKER=xxx`
+selects one). Use a unique `LABEL` per checkpoint and keep datasets, decoding,
+judge, and `WORK_DIR` fixed across comparisons.
 
 ## ablation
 

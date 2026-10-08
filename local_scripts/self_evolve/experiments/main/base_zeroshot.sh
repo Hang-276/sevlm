@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Base model zero-shot: no training at all; inference straight on the
-# Tier-1 benchmarks.
-#
-# The six Tier-1 general-ability benchmarks (see docs/EVALUATION.md):
-#   MMVP  MMStar  BLINK  RealWorldQA  AI2D_TEST  ChartQA_TEST
+# nine target benchmarks (see EVAL_DATASETS.md).
 #
 # Usage:
 #   bash local_scripts/self_evolve/experiments/main/base_zeroshot.sh
@@ -14,7 +11,7 @@
 set -euo pipefail
 # Use the isolated evaluator; never load training defaults or activate sevlm.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export DATASETS="${DATASETS:-MMVP MMStar BLINK RealWorldQA AI2D_TEST ChartQA_TEST}"
+export DATASETS="${DATASETS:-MMVP MMStar BLINK RealWorldQA AI2D_TEST ChartQA_TEST MMMU_Pro_10c CV-Bench-2D CV-Bench-3D}"
 export LABEL="${LABEL:-base}"
 # Experiment 1 always evaluates BASE_MODEL, not a CKPT left in the shell.
 unset CKPT

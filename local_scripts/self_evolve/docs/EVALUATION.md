@@ -1,7 +1,8 @@
 # Evaluation
 
-The goal here is a protocol that is directly comparable with the Vision-Zero
-paper, so our numbers can sit in the same table as theirs without an asterisk.
+The current protocol compares our own models on the same nine benchmarks with
+the same VLMEvalKit implementation. Published Vision-Zero numbers are context,
+not directly comparable without matching its full evaluation protocol.
 
 Run everything from the repo root:
 
@@ -20,7 +21,7 @@ From the Vision-Zero paper (arXiv 2509.25541) and its repo:
 | Backbones | Qwen2.5-VL-7B, InternVL3-8B, InternVL3-14B |
 | Compared against | R1-OneVision-7B, MM-Eureka-Qwen-7B, VLAA-Thinker-7B, OpenVLThinker-7B, ViGaL, plus GPT-4o |
 | Metric | each benchmark's official accuracy, plus a group mean |
-| Decoding | not stated explicitly in the parts of the appendix we could read. VLMEvalKit defaults to greedy (temperature 0), which is what we use |
+| Decoding | not established here; do not infer it from VLMEvalKit defaults |
 
 Their benchmark suite, 13 in two groups:
 
@@ -46,9 +47,9 @@ weeks stop being comparable:
 
 - **Framework**: VLMEvalKit, pinned to one commit for the whole project. Note
   the commit in the results.
-- **Decoding**: greedy, temperature 0, `max_new_tokens=2048` (VLMEvalKit's
-  default; Vision-Zero does not state theirs, so the default is the safest
-  choice).
+- **Decoding**: the current scripts pin `max_new_tokens=2048`,
+  `temperature=0.01`, `top_p=0.001`, `top_k=1`, `do_sample=true` (near-greedy).
+  Set `DO_SAMPLE=false` for strict greedy, always for every model together.
 - **Attention**: sdpa. flash-attn is not required and sdpa is numerically
   equivalent for inference.
 - **Splits and metrics**: each benchmark's official split and official metric.
@@ -76,17 +77,15 @@ directory. `main/eval.sh` resolves this for you — it merges the last round's
 adapter when needed, and picks the newest checkpoint from a trainer output
 directory.
 
-## Two tiers, to save compute
+## Current nine-benchmark suite
 
-13 benchmarks at 7B is not cheap, so:
-
-- **Tier-1, six benchmarks** (run after every training run):
-  `MMVP, MMStar, BLINK, RealWorldQA, ChartQA, AI2D`
-- **Tier-2, all 13** (only when producing the final table): add
-  `TextVQA, DocVQA, InfoVQA, OCRBench, SEEDBench2, MuirBench, CRPE`
+All default evaluation entries run exactly
+`MMVP MMStar BLINK RealWorldQA AI2D_TEST ChartQA_TEST MMMU_Pro_10c CV-Bench-2D CV-Bench-3D`.
+For a cheap smoke run, override `DATASETS=MMVP`; use a distinct LABEL or finish
+the missing eight before computing the nine-benchmark average.
 
 ```bash
-# One-off: fetch the Tier-1 benchmark tsvs into LMUData
+# Optional: prefetch the first six benchmark TSVs into LMUData
 bash local_scripts/self_evolve/eval/fetch_vlmeval_tsv.sh
 
 # The base zero-shot row
@@ -99,20 +98,21 @@ bash local_scripts/self_evolve/experiments/main/eval.sh <run_dir>
 ```
 
 Results land under the evaluation work directory from `paths.sh`, one
-subdirectory per model, with `*_acc.csv` holding the scores.
-`analysis/collect_results.sh` assembles them into one table.
+subdirectory per model and possibly a VLMEvalKit eval-ID subdirectory.
+`analysis/collect_results.sh` assembles the nine `*_acc.csv` metrics, checks
+protocol compatibility, and withholds AVG(9) if any model is incomplete.
 
 ## The comparison table
 
-Main table, Tier-2, every row run by us:
+Main table, all nine, every row run by us:
 
-| Model | AI2D | ChartQA | TextVQA | DocVQA | InfoVQA | OCRBench | SEEDBench2 | RealWorldQA | MMVP | MMStar | BLINK | MuirBench | CRPE | Avg |
-|-------|------|---------|---------|--------|---------|----------|-----------|-------------|------|--------|-------|-----------|------|-----|
-| base | | | | | | | | | | | | | | |
-| vision_zero | | | | | | | | | | | | | | |
-| **ours** | | | | | | | | | | | | | | |
+| Model | MMVP | MMStar | BLINK | RealWorldQA | AI2D_TEST | ChartQA_TEST | MMMU_Pro_10c | CV-Bench-2D | CV-Bench-3D | AVG(9) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| base | | | | | | | | | | |
+| vision_zero | | | | | | | | | | |
+| ours | | | | | | | | | | |
 
-Method comparisons, Tier-1 is enough. The scripts for each are in
+The scripts for method comparisons are in
 `../experiments/README.md`:
 
 | exp | what it removes | what it answers |

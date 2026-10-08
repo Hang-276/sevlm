@@ -12,6 +12,7 @@ is intentionally NO scalar gate / cap here — shortcut samples are kept out of
 SFT by these vector conditions, not by clamping the scalar reward.
 """
 
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 from open_r1.self_evolve.reward_config import RewardConfig
@@ -49,9 +50,15 @@ def route_with_config(
     - failure:       every trajectory that does not satisfy the positive gate,
                      including correct answers with weak reasoning/grounding.
     """
-    answer = float(reward_vector.get("answer", 0.0))
-    grounding = float(reward_vector.get("grounding", 0.0))
-    process = float(reward_vector.get("process", 0.0))
+    try:
+        answer = float(reward_vector.get("answer", 0.0))
+        grounding = float(reward_vector.get("grounding", 0.0))
+        process = float(reward_vector.get("process", 0.0))
+    except (TypeError, ValueError):
+        return "failure", "invalid_reward_vector"
+    if any(not math.isfinite(value) or not 0.0 <= value <= 1.0
+           for value in (answer, grounding, process)):
+        return "failure", "invalid_reward_vector"
     format_valid, shortcut_detected = _flags(reward_vector, reward_details, failure_tags)
     evidence_mismatch = "evidence_mismatch" in failure_tags
 
@@ -69,6 +76,16 @@ def route_with_config(
         return "failure", "correct_answer_but_grounding_below_threshold"
     if process < config.positive_min_process:
         return "failure", "correct_answer_but_process_below_threshold"
+    if config.positive_min_visual_facts > 0.0:
+        details = reward_details or reward_vector.get("reward_details") or {}
+        process_details = details.get("process") or {}
+        fact_score = process_details.get("visual_facts_score")
+        try:
+            fact_score = float(fact_score)
+        except (TypeError, ValueError):
+            fact_score = float("nan")
+        if not math.isfinite(fact_score) or not 0.0 <= fact_score <= 1.0 or fact_score < config.positive_min_visual_facts:
+            return "failure", "correct_answer_but_visual_facts_incomplete"
     if shortcut_detected:
         return "failure", "correct_answer_but_shortcut_detected"
     if evidence_mismatch:

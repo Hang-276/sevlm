@@ -42,7 +42,7 @@ banner() {
 }
 
 # Load .env (API keys etc.); anything already exported in the shell wins.
-load_env() { [ -f "$ENV_FILE" ] && { set -a; . "$ENV_FILE"; set +a; }; }
+load_env() { if [ -f "$ENV_FILE" ]; then set -a; . "$ENV_FILE"; set +a; fi; }
 
 # Existence checks up front — unfilled placeholder paths fail here, not
 # halfway through training.
@@ -70,7 +70,7 @@ merge_final_adapter() {
 
   # Highest-numbered round's GRPO adapter
   local adapter
-  adapter="$(ls -d "$run_dir"/iter_*/checkpoints/grpo 2>/dev/null | sort | tail -1)"
+  adapter="$(ls -d "$run_dir"/iter_*/checkpoints/grpo 2>/dev/null | sort -V | tail -1)"
   [ -n "$adapter" ] || { echo "[ERROR] no iter_*/checkpoints/grpo found under $run_dir" >&2; return 2; }
   # Neither a LoRA adapter nor a full model -> invalid directory, stop here.
   if [ ! -f "$adapter/adapter_config.json" ] && [ ! -f "$adapter/config.json" ]; then
@@ -115,7 +115,7 @@ resolve_eval_model() {
   fi
 
   local ckpt
-  ckpt="$(ls -d "$dir"/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1)"
+  ckpt="$(ls -d "$dir"/checkpoint-* 2>/dev/null | sort -V | tail -1)"
   if [ -n "$ckpt" ]; then
     echo "[eval] using latest checkpoint: $ckpt" >&2
     if [ -f "$ckpt/adapter_config.json" ]; then

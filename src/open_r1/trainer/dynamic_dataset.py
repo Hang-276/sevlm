@@ -1,8 +1,14 @@
 from typing import Callable, Optional, Any, Dict, Union
+from copy import deepcopy
+from contextlib import contextmanager
+import inspect
 import torch
+import numpy as np
 from torch.utils.data import IterableDataset
 from transformers.utils import logging
 import random
+
+from open_r1.grpo_data import prepare_grpo_sample
 
 logger = logging.get_logger(__name__)
 
@@ -34,22 +40,46 @@ class DynamicIterableDataset(IterableDataset):
         self.question_prompt = question_prompt or "Question: {Question}"
         self.seed = seed
         self.current_epoch = 0
+        try:
+            inspect.signature(data_generator_func).bind(epoch=0, sample_idx=0)
+            self._accepts_epoch_arguments = True
+        except (TypeError, ValueError):
+            self._accepts_epoch_arguments = False
         
     def set_epoch(self, epoch: int):
         """Set the current epoch (called by trainer)"""
         self.current_epoch = epoch
-        # Set different seed for each epoch to ensure variety
-        if self.seed is not None:
-            random.seed(self.seed + epoch)
-            torch.manual_seed(self.seed + epoch)
         logger.info(f"DynamicIterableDataset: Starting epoch {epoch}")
+
+    @contextmanager
+    def _generation_rng(self, index):
+        if self.seed is None:
+            yield
+            return
+        seed = self.seed + self.current_epoch * self.epoch_size + index
+        python_state, numpy_state = random.getstate(), np.random.get_state()
+        with torch.random.fork_rng(devices=[]):
+            try:
+                random.seed(seed)
+                np.random.seed(seed % (2 ** 32))
+                torch.random.default_generator.manual_seed(seed)
+                yield
+            finally:
+                random.setstate(python_state)
+                np.random.set_state(numpy_state)
+
+    def _generate_sample(self, index, with_epoch=False):
+        with self._generation_rng(index):
+            if with_epoch and self._accepts_epoch_arguments:
+                return self.data_generator_func(epoch=self.current_epoch, sample_idx=index)
+            return self.data_generator_func()
     
     def __iter__(self):
         """Generate samples for current epoch"""
         for i in range(self.epoch_size):
             try:
                 # Generate new data sample
-                sample = self.data_generator_func()
+                sample = self._generate_sample(i)
                 
                 # Process the sample to match expected format
                 processed_sample = self._process_sample(sample)
@@ -73,36 +103,7 @@ class DynamicIterableDataset(IterableDataset):
             # The trainer handles the two-phase processing directly
             return sample
         
-        # Extract basic required fields for standard samples
-        processed = {
-            'problem': sample.get('problem', ''),
-            'solution': sample.get('solution', ''),
-            'accu_reward_method': sample.get('accu_reward_method', 'default'),
-        }
-        
-        # Ensure solution has proper format
-        if not processed['solution'].startswith('<answer>'):
-            processed['solution'] = f"<answer> {processed['solution']} </answer>"
-        
-        # Handle image paths
-        if 'image_path' in sample and sample['image_path'] is not None:
-            processed['image_path'] = sample['image_path']
-            # Create prompt with images
-            processed['prompt'] = [{
-                'role': 'user',
-                'content': [
-                    *({'type': 'image', 'text': None} for _ in range(len(sample['image_path']))),
-                    {'type': 'text', 'text': self.question_prompt.format(Question=sample['problem'])}
-                ]
-            }]
-        else:
-            # Text-only prompt
-            processed['prompt'] = [{
-                'role': 'user',
-                'content': [
-                    {'type': 'text', 'text': self.question_prompt.format(Question=sample['problem'])}
-                ]
-            }]
+        processed = prepare_grpo_sample(sample, self.question_prompt)
         
         # Handle metadata fields that need to be preserved for reward calculation
         # For sudoku-specific fields, preserve original format; for others, wrap in list
@@ -143,13 +144,7 @@ class EpochAwareIterableDataset(DynamicIterableDataset):
         
         for i in range(self.epoch_size):
             try:
-                # Pass epoch info to generator if it accepts it
-                try:
-                    # Try calling with epoch info
-                    sample = self.data_generator_func(epoch=self.current_epoch, sample_idx=i)
-                except TypeError:
-                    # Fall back to no arguments
-                    sample = self.data_generator_func()
+                sample = self._generate_sample(i, with_epoch=True)
                 
                 # Validate that we got a valid sample
                 if sample is None:
@@ -184,6 +179,7 @@ class CyclicDynamicDataset(IterableDataset):
         base_dataset: Union[DynamicIterableDataset, EpochAwareIterableDataset],
         num_generations: int,
         num_iterations: int,
+        batch_size: int = 1,
     ):
         """
         Args:
@@ -194,6 +190,13 @@ class CyclicDynamicDataset(IterableDataset):
         self.base_dataset = base_dataset
         self.num_generations = num_generations
         self.num_iterations = num_iterations
+        self.batch_size = batch_size
+        for name in ('num_generations', 'num_iterations', 'batch_size'):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if self._unique_sample_count() == 0:
+            raise ValueError("Dynamic epoch must contain at least one complete GRPO batch")
         self.current_epoch = 0
         self._cached_samples = []
         self._cache_epoch = -1
@@ -213,66 +216,36 @@ class CyclicDynamicDataset(IterableDataset):
     def _generate_cycle_samples(self):
         """Generate samples for one complete cycle"""
         if not self._cached_samples or self._cache_epoch != self.current_epoch:
-            logger.info(f"CyclicDynamicDataset: Generating new samples for epoch {self.current_epoch}")
-            
-            # Generate fresh samples from base dataset
             base_iterator = iter(self.base_dataset)
             samples = []
-            
-            # Calculate how many unique samples we need
-            effective_batch_size = len(self.base_dataset) // self.num_generations
-                
-            successful_samples = 0
-            attempts = 0
-            max_attempts = effective_batch_size * 2  # Allow some failures
-            
-            while successful_samples < effective_batch_size and attempts < max_attempts:
+            needed = self._unique_sample_count()
+            while len(samples) < needed:
                 try:
-                    sample = next(base_iterator)
-                    samples.append(sample)
-                    successful_samples += 1
-                    attempts += 1
-                except StopIteration:
-                    logger.warning(f"Base dataset exhausted after {successful_samples} successful samples (needed {effective_batch_size})")
-                    break
-                except Exception as e:
-                    logger.warning(f"Failed to get sample {attempts}: {e}")
-                    attempts += 1
-                    continue
-            
-            if successful_samples == 0:
-                logger.error("No samples could be generated! This will cause training to fail.")
-                # Create a minimal fallback sample to prevent complete failure
-                fallback_sample = {
-                    'accu_reward_method': 'clevr_spotdiff',
-                    'game_data': {'game_id': 'fallback', 'spy_player': 1, 'num_players': 4},
-                    'metadata': {'fallback': True}
-                }
-                samples = [fallback_sample]
-                successful_samples = 1
-            
-            logger.info(f"CyclicDynamicDataset: Generated {successful_samples} samples successfully")
-            
-            # Create the cyclic pattern
-            self._cached_samples = []
-            for sample in samples:
-                # For each sample, repeat it num_generations * num_iterations times
+                    samples.append(next(base_iterator))
+                except StopIteration as exc:
+                    raise RuntimeError(
+                        f"Dynamic generator produced {len(samples)} samples; a complete epoch needs {needed}"
+                    ) from exc
+            cached = []
+            for offset in range(0, needed, self.batch_size):
+                batch = samples[offset:offset + self.batch_size]
                 for _ in range(self.num_iterations):
-                    for _ in range(self.num_generations):
-                        self._cached_samples.append(sample)
-            
+                    for sample in batch:
+                        cached.extend([sample] * self.num_generations)
+            self._cached_samples = cached
             self._cache_epoch = self.current_epoch
-            logger.info(f"CyclicDynamicDataset: Cached {len(self._cached_samples)} samples")
+
+    def _unique_sample_count(self):
+        unique = len(self.base_dataset) // self.num_generations
+        return unique // self.batch_size * self.batch_size
     
     def __iter__(self):
         """Return cached samples in cyclic pattern"""
         self._generate_cycle_samples()
         
         for sample in self._cached_samples:
-            yield sample
+            yield deepcopy(sample)
     
     def __len__(self):
         """Return total length including repetitions"""
-        base_length = len(self.base_dataset)
-        effective_batch_size = base_length // self.num_generations
-        return effective_batch_size * self.num_generations * self.num_iterations 
+        return self._unique_sample_count() * self.num_generations * self.num_iterations

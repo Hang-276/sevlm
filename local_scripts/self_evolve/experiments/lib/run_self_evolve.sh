@@ -86,7 +86,8 @@ load_env
 [ -f "$REWARD_JSON" ] || { echo "[ERROR] reward config does not exist: $REWARD_JSON" >&2; exit 2; }
 
 # ---- RUN_TAG (fixed name, no timestamp) ----
-# If OUT_DIR exists, the run resumes automatically (two levels of resume):
+# If OUT_DIR exists with a matching experiment protocol, the run resumes
+# automatically (two levels of resume):
 #   - iter_NNN/iteration_state.json present => that round is complete, skip it;
 #     re-enter at the first unfinished iter
 #   - inside the re-entered round: candidate/accepted/reference jsonl all

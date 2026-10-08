@@ -38,10 +38,12 @@
 # GRPO_MAX_PROMPT_LEN, since the images have to fit in the prompt.
 : "${GRPO_MIN_PIXELS:=802816}"        # 1024*28*28
 : "${GRPO_MAX_PIXELS:=1003520}"       # 1280*28*28
-# Advantages subtract the group mean but don't divide by std (Dr. GRPO).
-# Dividing re-inflates the format-only variance of answer-saturated groups
-# back to unit scale.
+# Center advantages without std division to avoid amplifying format-only variance.
+# Keep per-response loss normalization unless explicitly overridden.
 : "${GRPO_SCALE_REWARDS:=False}"
+: "${GRPO_LOSS_TYPE:=grpo}"
+# Empty uses max_completion_length; a positive constant sets gradient scale.
+: "${GRPO_LOSS_NORMALIZATION_LENGTH:=}"
 # Rollouts truncated by max_completion_length (no EOS) get zero advantage.
 : "${GRPO_OVERLONG_FILTERING:=True}"
 : "${GRPO_DYNAMIC_SAMPLING:=True}"
@@ -61,6 +63,11 @@
 : "${SFT_PER_DEVICE_BATCH:=8}"
 : "${SFT_WEIGHT_DECAY:=0.0}"
 : "${SFT_MAX_STEPS:=}"
+# Empty preserves the checkpoint's image-processor defaults. Experiments that
+# add visual SFT targets may set these independently from GRPO's larger image
+# budget; the SFT collator reads several images per example at once.
+: "${SFT_MIN_PIXELS:=}"
+: "${SFT_MAX_PIXELS:=}"
 
 # --- Main-table protocol ---
 # Every exp in the main results table must share these. If two exps differ
@@ -118,7 +125,7 @@
 # --- Offline solver rollouts (the scoring / buffer-building pass) ---
 # Length must match GRPO; too low a temperature (e.g. 0.2) makes the group
 # nearly identical and every advantage 0.
-: "${SOLVER_MAX_NEW_TOKENS:=1024}"
+: "${SOLVER_MAX_NEW_TOKENS:=$GRPO_MAX_COMPLETION_LEN}"
 : "${SOLVER_TEMPERATURE:=1.0}"
 : "${SOLVER_TOP_P:=0.95}"
 
@@ -131,7 +138,9 @@
 
 build_grpo_extra() {
   local steps=""
+  local loss_normalization=""
   [ -n "${GRPO_MAX_STEPS:-}" ] && steps="--max_steps $GRPO_MAX_STEPS"
+  [ -n "$GRPO_LOSS_NORMALIZATION_LENGTH" ] && loss_normalization="--loss_normalization_length $GRPO_LOSS_NORMALIZATION_LENGTH"
   echo "$steps --learning_rate $GRPO_LR --warmup_ratio $GRPO_WARMUP_RATIO" \
        "--lr_scheduler_type $GRPO_LR_SCHEDULER --beta $GRPO_BETA" \
        "--max_prompt_length $GRPO_MAX_PROMPT_LEN" \
@@ -143,6 +152,7 @@ build_grpo_extra() {
        "--vllm_max_model_len $GRPO_VLLM_MAX_MODEL_LEN" \
        "--vllm_max_images $GRPO_VLLM_MAX_IMAGES --vllm_max_num_seqs $GRPO_VLLM_MAX_NUM_SEQS" \
        "--scale_rewards $GRPO_SCALE_REWARDS" \
+       "--loss_type $GRPO_LOSS_TYPE $loss_normalization" \
        "--overlong_filtering $GRPO_OVERLONG_FILTERING" \
        "--dynamic_sampling $GRPO_DYNAMIC_SAMPLING" \
        "--dynamic_sampling_mode $GRPO_DYNAMIC_MODE" \
@@ -153,11 +163,14 @@ build_grpo_extra() {
 
 build_sft_extra() {
   local steps=""
+  local image_pixels=""
   [ -n "${SFT_MAX_STEPS:-}" ] && steps="--max_steps $SFT_MAX_STEPS"
+  [ -n "$SFT_MIN_PIXELS" ] && image_pixels="$image_pixels --min_pixels $SFT_MIN_PIXELS"
+  [ -n "$SFT_MAX_PIXELS" ] && image_pixels="$image_pixels --max_pixels $SFT_MAX_PIXELS"
   echo "$steps --learning_rate $SFT_LR --warmup_ratio $SFT_WARMUP_RATIO" \
        "--lr_scheduler_type $SFT_LR_SCHEDULER" \
        "--per_device_train_batch_size $SFT_PER_DEVICE_BATCH" \
-       "--weight_decay $SFT_WEIGHT_DECAY --save_steps 2 $CLIP $GC_KWARGS"
+       "--weight_decay $SFT_WEIGHT_DECAY --save_steps 2 $image_pixels $CLIP $GC_KWARGS"
 }
 
 

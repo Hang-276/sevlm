@@ -8,8 +8,8 @@
 #   MARKER=grpo_baseline bash .../main/eval.sh
 #   WITH_BASE=0 DATASETS="MMVP" bash .../main/eval.sh <run_dir>
 #
-# Every exp shares this single entry, so dataset / judge / decoding settings
-# stay identical.
+# Every exp shares the isolated checkpoint evaluator, so all nine target
+# datasets and decoding/judge settings stay identical.
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/common.sh"
 
@@ -19,9 +19,15 @@ RUN_DIR="${1:-$(last_run "${MARKER:-ours}")}"
 
 LABEL="${LABEL:-$(basename "$RUN_DIR")}"
 banner "eval  |  run=$RUN_DIR"
-require_paths
 MODEL="$(resolve_eval_model "$RUN_DIR")"
-
-PAIRS=("$LABEL=$MODEL")
-[ "${WITH_BASE:-1}" = "1" ] && PAIRS+=("base=$BASE_MODEL")
-run_tier1_eval "${PAIRS[@]}"
+export WORKSPACE BASE_MODEL VLMK LMUDATA
+export EVAL_PY="${EVAL_PY:-$PY}"
+export DATASETS="${DATASETS:-MMVP MMStar BLINK RealWorldQA AI2D_TEST ChartQA_TEST MMMU_Pro_10c CV-Bench-2D CV-Bench-3D}"
+case "${WITH_BASE:-1}" in
+  0|1) ;;
+  *) echo "[ERROR] WITH_BASE must be 0 or 1" >&2; exit 2;;
+esac
+LABEL="$LABEL" bash "$EXP_DIR/analysis/eval_checkpoint.sh" "$MODEL"
+if [ "${WITH_BASE:-1}" = "1" ] && [ "$LABEL" != base ]; then
+  LABEL=base bash "$EXP_DIR/analysis/eval_checkpoint.sh" "$BASE_MODEL"
+fi

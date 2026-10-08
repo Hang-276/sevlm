@@ -10,7 +10,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/../lib/common.sh"
 
 WORK_DIR="${WORK_DIR:-$EVAL_WORK_DIR}"
-ARGS=(--work-dir "$WORK_DIR" --format "${FORMAT:-md}")
+read -r -a REQUESTED_DATASETS <<< "${DATASETS:-MMVP MMStar BLINK RealWorldQA AI2D_TEST ChartQA_TEST MMMU_Pro_10c CV-Bench-2D CV-Bench-3D}"
+ARGS=(--work-dir "$WORK_DIR" --format "${FORMAT:-md}" --datasets "${REQUESTED_DATASETS[@]}")
 [ $# -gt 0 ] && ARGS+=(--labels "$@")
 [ "${VERBOSE:-0}" = "1" ] && ARGS+=(--verbose)
 [ -n "${OUT_JSON:-}" ] && ARGS+=(--out "$OUT_JSON")

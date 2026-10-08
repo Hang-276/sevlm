@@ -86,6 +86,31 @@ def build_requests(prompts, images_by_prompt):
     ]
 
 
+def finite_rollout_logits(scores, banned_token_ids):
+    """Scrub non-finite logits and exclude only in-vocabulary token ids."""
+    if not torch.isfinite(scores).all():
+        floor = torch.finfo(scores.dtype).min
+        scores = torch.nan_to_num(scores, nan=floor, posinf=1e4, neginf=floor)
+        bad_rows = scores.max(dim=-1).values <= floor
+        scores[bad_rows] = 0.0
+    banned = [token for token in banned_token_ids if 0 <= token < scores.shape[-1]]
+    scores[..., banned] = float("-inf")
+    if not torch.isfinite(scores).any(dim=-1).all():
+        raise ValueError("No allowed finite rollout token remains")
+    return scores
+
+
+def eos_completion_mask(completion_ids, eos_token_ids):
+    """Include the first EOS and mark rows without one as truncated."""
+    if eos_token_ids is None:
+        is_eos = torch.zeros_like(completion_ids, dtype=torch.bool)
+    else:
+        ids = torch.as_tensor(eos_token_ids, device=completion_ids.device).reshape(-1)
+        is_eos = torch.isin(completion_ids, ids)
+    before_eos = is_eos.int().cumsum(dim=1) - is_eos.int()
+    return (before_eos == 0).int(), ~is_eos.any(dim=1)
+
+
 def completion_tensors(outputs, expected_prompts, pad_token_id, device):
     """Validate HF/vLLM image-token expansion, then pad only the completions."""
     if len(outputs) != len(expected_prompts):
@@ -95,6 +120,8 @@ def completion_tensors(outputs, expected_prompts, pad_token_id, device):
             raise RuntimeError("HF/vLLM prompt token mismatch; check image processing and chat templates.")
         if not output["token_ids"]:
             raise RuntimeError("vLLM returned an empty completion.")
+        if output["finish_reason"] not in {"stop", "length"}:
+            raise RuntimeError(f"vLLM completion did not finish normally: {output['finish_reason']!r}")
     lengths = torch.tensor([len(o["token_ids"]) for o in outputs], device=device)
     ids = torch.full((len(outputs), int(lengths.max())), pad_token_id, dtype=torch.long, device=device)
     for row, output in zip(ids, outputs):

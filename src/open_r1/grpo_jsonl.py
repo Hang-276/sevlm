@@ -19,7 +19,7 @@ from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional
 # from babel.numbers import parse_decimal  # Not used
-from utils.math import compute_score
+from open_r1.utils.math import compute_score
 from datasets import load_dataset, load_from_disk
 from transformers import Qwen2VLForConditionalGeneration
 
@@ -28,18 +28,18 @@ from open_r1.trainer import VLMGRPOTrainer, GRPOConfig
 from trl import ModelConfig, ScriptArguments, TrlParser, get_peft_config
 import PIL
 from Levenshtein import ratio
-from open_r1.utils.pycocotools.coco import COCO
-from open_r1.utils.pycocotools.cocoeval import COCOeval
 import json
 import math
 from json_repair import repair_json
 
 from open_r1.vlm_modules import *
 from open_r1.trainer.dynamic_dataset import DynamicIterableDataset, EpochAwareIterableDataset, CyclicDynamicDataset
+from open_r1.grpo_data import normalize_reward_context, prepare_grpo_sample
 
 from typing import Tuple
 from transformers.utils import logging
 from transformers import AutoProcessor, AutoTokenizer
+from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 
 from openai import OpenAI
 
@@ -51,9 +51,10 @@ from types import SimpleNamespace
 
 logger = logging.get_logger(__name__)
 
-client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY", "sk-proj-1234567890"),
-    base_url=os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")
+client = (
+    OpenAI(api_key=os.environ["OPENAI_API_KEY"],
+           base_url=os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1"))
+    if os.getenv("OPENAI_API_KEY") else None
 )
 
 from open_r1.qwen2_5vl_monkey_patch import monkey_patch_qwen2_5vl_flash_attn, monkey_patch_qwen2_5vl_forward, monkey_patch_torch_load, monkey_patch_deepspeed_bf16_nan_skip
@@ -149,7 +150,7 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "Maximum number of clues in Sudoku puzzles"},
     )
     sudoku_output_dir: Optional[str] = field(
-        default="/home/colligo/sudoku_images",
+        default="data/sudoku_images",
         metadata={"help": "Directory to save generated Sudoku images"},
     )
     sudoku_board_size: Optional[int] = field(
@@ -157,11 +158,11 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "Size of the Sudoku board (e.g., 3, 4, 6, 9)"},
     )
     clevr_images_dir: Optional[str] = field(
-        default="/home/colligo/clevr-dataset-gen/output/comparison_images",
+        default="data/Vision-Zero-clevr-dataset/output/comparison_images",
         metadata={"help": "Directory containing CLEVR comparison images"},
     )
     clevr_scenes_dir: Optional[str] = field(
-        default="/home/colligo/clevr-dataset-gen/output/comparison_scenes",
+        default="data/Vision-Zero-clevr-dataset/output/comparison_scenes",
         metadata={"help": "Directory containing CLEVR comparison scene JSON files"},
     )
     clevr_num_players: Optional[int] = field(
@@ -230,6 +231,8 @@ def extract_choice(text):
 
 def evaluate_answer_similarity(student_answer, ground_truth):
     """Use llm to evaluate answer similarity."""
+    if client is None:
+        return 1.0 if student_answer == ground_truth else 0.0
     try:
         response = client.chat.completions.create(
             model="qwen2.5:7b",
@@ -305,6 +308,9 @@ def yes_no_reward(content, sol, **kwargs):
 
 # score_type: 0 for mAP, 1 for mAP 50
 def calculate_map(pred_bbox_list, gt_bbox_list, score_type=0):
+    from open_r1.utils.pycocotools.coco import COCO
+    from open_r1.utils.pycocotools.cocoeval import COCOeval
+
     # Calculate mAP
 
     # Initialize COCO object for ground truth
@@ -632,7 +638,6 @@ def detection_score(content, sol, iou_threshold=0.5, alpha=0.7, beta=0.0, gamma=
     return final_score
 
 def cosine_reward(content, tokenizer, acc_reward, **kwargs):
-    #https://arxiv.org/abs/2502.03373
     min_len_value_wrong = 0.0
     max_len_value_wrong = -0.5
     min_len_value_correct = 1.0
@@ -1047,6 +1052,8 @@ def main(script_args, training_args, model_args):
 
     # Check if using dynamic dataset
     if script_args.use_dynamic_dataset:
+        if training_args.world_size > 1 and script_args.data_generator_seed is None:
+            raise ValueError("Distributed dynamic GRPO requires a shared data_generator_seed")
         # Create data generator based on type
         if script_args.data_generator_type == "sudoku":
             # Import Sudoku generator
@@ -1222,21 +1229,26 @@ def main(script_args, training_args, model_args):
         train_dataset = CyclicDynamicDataset(
             base_dataset=base_dataset,
             num_generations=training_args.num_generations,
-            num_iterations=training_args.num_iterations
+            num_iterations=training_args.num_iterations,
+            batch_size=(training_args.train_batch_size
+                        * training_args.world_size
+                        * training_args.gradient_accumulation_steps
+                        // (training_args.num_generations or 1)),
         )
-        
-        # For dynamic dataset, we create a simple eval dataset from a small subset
-        def simple_eval_generator():
-            # Generate evaluation data (you might want to use a fixed set)
-            return data_generator_func()
         
         eval_dataset = None
         if script_args.val_split_ratio > 0:
-            eval_dataset = DynamicIterableDataset(
-                data_generator_func=simple_eval_generator,
-                epoch_size=max(1, int(script_args.epoch_size * script_args.val_split_ratio)),
+            eval_batch_size = training_args.eval_batch_size * training_args.world_size
+            eval_base = EpochAwareIterableDataset(
+                data_generator_func=data_generator_func,
+                epoch_size=max(eval_batch_size, training_args.num_generations,
+                               int(script_args.epoch_size * script_args.val_split_ratio)),
                 question_prompt=question_prompt,
-                seed=script_args.data_generator_seed + 1,
+                seed=None if script_args.data_generator_seed is None else script_args.data_generator_seed + 1,
+            )
+            eval_dataset = CyclicDynamicDataset(
+                eval_base, num_generations=training_args.num_generations, num_iterations=1,
+                batch_size=eval_batch_size // (training_args.num_generations or 1),
             )
         
         splits = {'train': train_dataset}
@@ -1293,42 +1305,16 @@ def main(script_args, training_args, model_args):
                     
                     del item['conversations']
                     item['accu_reward_method'] = item.get('accu_reward_method', accu_reward_method) # if accu_reward_method is in the data jsonl, use the value in the data jsonl, otherwise use the defined value
+                    item['self_evolve'] = json.dumps(
+                        normalize_reward_context(item.get('self_evolve', {})), ensure_ascii=False,
+                    )
                     all_data.append(item)
 
         dataset = Dataset.from_list(all_data)
 
         def make_conversation_from_jsonl(example):
-            if 'image_path' in example and example['image_path'] is not None:
-                assert all(os.path.exists(p) for p in example['image_path']), f"Image paths do not exist: {example['image_path']}"
-                # Don't load image here, just store the path
-                return {
-                    'image_path': [p for p in example['image_path']],  # Store path instead of loaded image
-                    'problem': example['problem'],
-                    'solution': f"<answer> {example['solution']} </answer>",
-                    'accu_reward_method': example['accu_reward_method'],
-                    # Pass-through self-evolve context (JSON string) for live refined reward.
-                    'self_evolve': json.dumps(example.get('self_evolve', {}), ensure_ascii=False),
-                    'prompt': [{
-                        'role': 'user',
-                        'content': [
-                            *({'type': 'image', 'text': None} for _ in range(len(example['image_path']))),
-                            {'type': 'text', 'text': question_prompt.format(Question=example['problem'])}
-                        ]
-                    }]
-                }
-            else:
-                return {
-                    'problem': example['problem'],
-                    'solution': f"<answer> {example['solution']} </answer>",
-                    'accu_reward_method': example['accu_reward_method'],
-                    'self_evolve': json.dumps(example.get('self_evolve', {}), ensure_ascii=False),
-                    'prompt': [{
-                        'role': 'user',
-                        'content': [
-                            {'type': 'text', 'text': question_prompt.format(Question=example['problem'])}
-                        ]
-                    }]
-                }
+            row = {**example, 'self_evolve': example.get('self_evolve', {})}
+            return prepare_grpo_sample(row, question_prompt, check_images=True)
 
         # Map the conversations
         dataset = dataset.map(make_conversation_from_jsonl, num_proc=8)
@@ -1394,7 +1380,7 @@ if __name__ == "__main__":
     # vision tower params are sharded, every rank must all-gather them together
     # on mixed image/text batches or the ranks hang. training_args.fsdp is a
     # (possibly empty) list/str set by HF when --fsdp is passed.
-    _zero3 = bool(training_args.deepspeed) and "zero3" in training_args.deepspeed
+    _zero3 = is_deepspeed_zero3_enabled()
     _fsdp = bool(getattr(training_args, "fsdp", None))
     if _zero3 or _fsdp:
         _backend = "zero3" if _zero3 else "fsdp"

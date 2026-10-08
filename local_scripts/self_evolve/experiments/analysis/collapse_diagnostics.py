@@ -119,15 +119,22 @@ def main() -> int:
         if not scored:
             continue
         tasks = read_jsonl(it / "accepted_tasks.jsonl")
-        stats = task_statistics(group_by_task(scored))
-        summary = summarize(stats)
+        # Use the recorded curriculum, not today's environment or thresholds.
+        # Older runs without a failure profile retain the legacy recomputation.
+        try:
+            summary = json.loads((it / "failure_profile.json").read_text()).get("solvability")
+        except (OSError, ValueError, AttributeError):
+            summary = None
+        if not isinstance(summary, dict) or not summary:
+            summary = summarize(task_statistics(group_by_task(scored)))
         report["iterations"].append({
             "iteration": it.name,
             "answer": answer_diagnostics(scored),
             "grounding": grounding_diagnostics(scored),
             "solvability": {k: summary[k] for k in
                             ("num_tasks", "mean_solve_rate", "mean_regret",
-                             "advantage_collapse_rate", "class_counts")
+                             "advantage_collapse_rate", "class_counts",
+                             "mean_verified_pass_rate", "frontier_counts")
                             if k in summary},
             "counterfactual": counterfactual_sensitivity(scored, tasks),
             "proposer": proposal_report(

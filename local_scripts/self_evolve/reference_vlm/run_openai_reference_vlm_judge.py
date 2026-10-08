@@ -1,47 +1,5 @@
 #!/usr/bin/env python
-"""
-GPT-4o Reference VLM judge over candidate tasks (full-loop front stage).
-
-This is the **Reference VLM** stage of the Vision-Zero self-evolving loop:
-
-    Generator -> candidate tasks -> [GPT-4o Reference VLM] -> accepted tasks -> Solver VLM
-
-The Reference VLM evaluates each candidate task *before* it ever reaches the
-Solver. It decides whether the task is solvable, appropriately difficult,
-unambiguous, and verifiable from visual evidence, and it emits a reasoning
-budget plus reference reasoning steps that the downstream reward shaping reads.
-
-Provider support (the Reference VLM is a REQUIRED module, not optional):
-  - ``--reference-provider openrouter`` (default): OpenRouter relay, base URL
-    ``https://openrouter.ai/api/v1``, model slug ``openai/gpt-4o``, key from
-    ``OPENROUTER_API_KEY``.
-  - ``--reference-provider openai``: official OpenAI API, base URL
-    ``https://api.openai.com/v1``, key from ``OPENAI_API_KEY``.
-
-The API key is read from the
-environment only — never from code, never from a checked-in file, and is NEVER
-printed (no Authorization header is logged; errors print type/message only).
-
-USAGE (no API, structure check)::
-
-    python run_openai_reference_vlm_judge.py --help
-    python run_openai_reference_vlm_judge.py --task-jsonl tasks.jsonl \
-        --dataset-root /path/to/clevr --output-dir out/ref --dry-run
-
-USAGE (real OpenRouter GPT-4o reference smoke, key required)::
-
-    read -s OPENROUTER_API_KEY; export OPENROUTER_API_KEY
-    python run_openai_reference_vlm_judge.py --task-jsonl tasks.jsonl \
-        --dataset-root /path/to/clevr --output-dir out/ref \
-        --reference-provider openrouter --reference-model openai/gpt-4o \
-        --reference-base-url https://openrouter.ai/api/v1 --max-tasks 3
-
-Outputs (under --output-dir):
-  openai_reference_judgments.jsonl   — one judgment per candidate task
-  openai_reference_summary.json      — aggregate accept/reject stats
-
-This script does NOT train and does NOT modify the Vision-Zero trainer.
-"""
+"""Judge visual tasks and write acceptance metadata for the training loop."""
 
 from __future__ import annotations
 
@@ -67,11 +25,7 @@ def _resolve_provider_config(
     base_url: Optional[str],
     model: Optional[str],
 ) -> Dict[str, Optional[str]]:
-    """Resolve (api_key_env, base_url, model, api_key) for the provider.
-
-    Never returns or logs the key value beyond what the caller needs; the key
-    itself is only read here and passed straight to the client.
-    """
+    """Resolve provider credentials and endpoint from CLI values and environment."""
     if provider == "openrouter":
         key_env = "OPENROUTER_API_KEY"
         resolved_base = base_url or os.environ.get("OPENROUTER_BASE_URL") or OPENROUTER_BASE_URL_DEFAULT

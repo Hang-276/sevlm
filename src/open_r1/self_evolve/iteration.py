@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -11,8 +12,10 @@ from typing import Any, Dict, List, Optional
 from open_r1.self_evolve.buffer import route_with_config
 from open_r1.self_evolve.failure_tags import assign_failure_tags
 from open_r1.self_evolve.io import read_jsonl
+from open_r1.self_evolve.protocol_fingerprint import self_evolve_protocol_fingerprint
 from open_r1.self_evolve.reward_config import RewardConfig, load_reward_config
-from open_r1.self_evolve.rewards import compute_group_reward_vectors, parse_structured_answer
+from open_r1.self_evolve.rewards import answer_reward, compute_group_reward_vectors, is_format_valid, parse_structured_answer
+from open_r1.self_evolve.visual_facts import gold_changes_from_task
 
 
 REWARD_KEYS = ["answer", "budget", "process", "grounding", "consistency"]
@@ -109,6 +112,15 @@ def _build_task_metadata(
             task_metadata["valid_player_ids"] = [int(meta["spy_player"])]
         except (TypeError, ValueError):
             pass
+    variant = meta.get("variant") if isinstance(meta.get("variant"), dict) else {}
+    task_metadata["image_width"] = int(variant.get("image_width") or 320)
+    task_metadata["image_height"] = int(variant.get("image_height") or 240)
+
+    # Offline buffer routing must score the same visual certificate as live
+    # GRPO. The trajectory carries its source task, including the retained
+    # variant indices; derive the gold transitions from that exact task.
+    fact_task = self_evolve_task if self_evolve_task else example
+    task_metadata["gold_visual_changes"] = gold_changes_from_task(fact_task)
 
     return task_metadata
 
@@ -194,6 +206,12 @@ def _score_task(
     pred_boxes_per_traj = [
         _extract_predicted_boxes(ex) for ex in task_examples
     ]
+    if reward_config.process_cfg["mode"] == "visual_facts":
+        # The live GRPO reward only reads boxes from the completion. External
+        # or keyword-derived trajectory fields would otherwise let offline
+        # routing select a positive that earned no grounding during training.
+        grounding_scores = [None] * len(task_examples)
+        pred_boxes_per_traj = [None] * len(task_examples)
     gold_boxes = _extract_gold_boxes(first_example)
 
     reward_vectors = compute_group_reward_vectors(
@@ -211,6 +229,7 @@ def _score_task(
         answer_judge_force=_answer_judge_force(),
         answer_judge_sample_n=_answer_judge_sample_n(),
         problem=task_examples[0].get("problem") or task_examples[0].get("prompt"),
+        reward_config=reward_config,
     )
 
     task_scored: List[Dict[str, Any]] = []
@@ -233,7 +252,11 @@ def _score_task(
         audit = reward_config.audit_fields(
             reward_vector,
             spy_correct=_spy_ok,
-            answer_correct=float(reward_vector.get("answer", 0.0)) >= 1.0,
+            # The live GRPO gate uses the exact answer string, even when the
+            # answer dimension awards full field-wise credit for a harmless
+            # formatting variant. Keep offline replay scalarization identical.
+            answer_correct=answer_reward(example.get("completion") or "", solution or "") >= 1.0,
+            format_valid=is_format_valid(example.get("completion") or ""),
         )
         reward_scalar = audit["reward_scalar_used"]
         if isinstance(details, dict):
@@ -265,7 +288,7 @@ def _score_task(
 
 def score_and_route_trajectories(
     trajectories: List[Dict[str, Any]],
-    default_max_reasoning_words: int = 120,
+    default_max_reasoning_words: Optional[int] = None,
     include_details: bool = False,
     reward_config: Optional[RewardConfig] = None,
     dataset_root: Optional[str] = None,
@@ -287,6 +310,8 @@ def score_and_route_trajectories(
     """
     if reward_config is None:
         reward_config = load_reward_config()
+    if default_max_reasoning_words is None:
+        default_max_reasoning_words = int(reward_config.budget_cfg["fallback_tokens"])
 
     # reward_details are required to read format_valid / shortcut_detected for
     # routing, so force them on regardless of the caller's flag.
@@ -300,20 +325,57 @@ def score_and_route_trajectories(
     # duplicate API spend.
     stream_fp = None
     done_task_ids: set[str] = set()
+    grouped = group_by_task(trajectories)
     if stream_path is not None:
         stream_path = Path(stream_path)
         stream_path.parent.mkdir(parents=True, exist_ok=True)
-        if stream_path.is_file():
+        protocol_path = stream_path.with_name(stream_path.name + ".protocol.json")
+        input_hash = hashlib.sha256(
+            json.dumps(trajectories, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+        ).hexdigest()
+        expected_protocol = {
+            "code_and_reward_sha256": self_evolve_protocol_fingerprint(reward_config.path),
+            "input_sha256": input_hash,
+            "dataset_root": str(Path(dataset_root).resolve()) if dataset_root else None,
+            "answer_judge": {
+                "enabled": _answer_judge_enabled(),
+                "dry_run": _answer_judge_dry_run(),
+                "force": _answer_judge_force(),
+                "sample_n": _answer_judge_sample_n(),
+            },
+        }
+        if stream_path.is_file() and stream_path.stat().st_size > 0:
+            try:
+                saved_protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(
+                    f"{stream_path} has scored rows without a readable protocol record; "
+                    "use a fresh run directory or disable resume."
+                ) from exc
+            if saved_protocol != expected_protocol:
+                raise RuntimeError(
+                    f"{stream_path} was scored under another task/reward/code protocol; "
+                    "use a fresh run directory or disable resume."
+                )
+            stream_counts: Dict[str, int] = defaultdict(int)
             for _row in read_jsonl(stream_path):
                 _tid = _row.get("task_id")
                 if _tid is not None:
                     done_task_ids.add(str(_tid))
+                    stream_counts[str(_tid)] += 1
                 scored.append(_row)
+            if any(task_id not in grouped or count != len(grouped[task_id])
+                   for task_id, count in stream_counts.items()) or len(scored) != sum(stream_counts.values()):
+                raise RuntimeError(
+                    f"{stream_path} has an incomplete or duplicate task group; "
+                    "use a fresh run directory or disable resume."
+                )
+        protocol_path.write_text(json.dumps(expected_protocol, indent=2), encoding="utf-8")
         stream_fp = stream_path.open("a", encoding="utf-8")
 
     pending = [
         (str(_task_id), task_examples)
-        for _task_id, task_examples in sorted(group_by_task(trajectories).items())
+        for _task_id, task_examples in sorted(grouped.items())
         if not (stream_fp is not None and str(_task_id) in done_task_ids)
     ]
 

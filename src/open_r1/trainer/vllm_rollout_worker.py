@@ -51,14 +51,12 @@ class RolloutLogitsProcessor:
         self.banned = banned
 
     def __call__(self, token_ids, logits):
-        import torch
+        if __package__:
+            from .vllm_rollout import finite_rollout_logits
+        else:
+            from vllm_rollout import finite_rollout_logits
 
-        logits = torch.nan_to_num(logits, nan=-1e9, posinf=1e4, neginf=-1e9)
-        if logits.max() <= -1e9:
-            logits.zero_()
-        banned = [i for i in self.banned if 0 <= i < logits.shape[-1]]
-        logits[banned] = float("-inf")
-        return logits
+        return finite_rollout_logits(logits, self.banned)
 
 
 def main(fd):
