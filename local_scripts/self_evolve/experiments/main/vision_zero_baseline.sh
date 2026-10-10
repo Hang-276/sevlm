@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# External baseline with aligned experiment settings.
+# External baseline: the official Vision-Zero implementation, run at the
+# training budget the Vision-Zero paper reports (100 iterations, batch 128
+# games). NOT aligned to the sevlm RL budget. See ../VISION_ZERO.md.
 # Does not source sevlm paths.sh, common.sh, train_defaults.sh or .env.
 # Setup and evaluation: ../VISION_ZERO.md. DRY_RUN=1 only prints the command.
 set -euo pipefail
@@ -12,6 +14,7 @@ readonly OFFICIAL_COMMIT="386fa20711130b9c7d8a340edd285c6242d8d255"
 : "${VISION_ZERO_OUTPUT:?Set VISION_ZERO_OUTPUT to a new absolute run directory}"
 
 fail() { echo "[ERROR] $*" >&2; exit 2; }
+warn() { echo "[WARN] $*" >&2; }
 for value in "$VISION_ZERO_REPO" "$VISION_ZERO_PY" "$VISION_ZERO_MODEL" \
              "$VISION_ZERO_DATASET" "$VISION_ZERO_OUTPUT"; do
   case "$value" in /*) ;; *) fail "Use absolute paths: $value" ;; esac
@@ -25,39 +28,110 @@ SCENES_DIR="$VISION_ZERO_DATASET/output/replacement_scenes"
 
 TRAIN_ROOT="$VISION_ZERO_REPO/src/open-r1-multimodal"
 ENTRY="$TRAIN_ROOT/src/open_r1/grpo_jsonl.py"
-ZERO_SOURCE="$TRAIN_ROOT/local_scripts/zero3_model_parallel.json"
-[ -f "$ENTRY" ] && [ -f "$ZERO_SOURCE" ] || fail "Not an official Vision-Zero checkout"
-ZERO_CONFIG="$VISION_ZERO_OUTPUT/zero3_vision_zero.json"
+ZERO_CONFIG="$TRAIN_ROOT/local_scripts/zero3_model_parallel.json"
+[ -f "$ENTRY" ] && [ -f "$ZERO_CONFIG" ] || fail "Not an official Vision-Zero checkout"
 ACTUAL_COMMIT="$(git -C "$VISION_ZERO_REPO" rev-parse HEAD)"
 [ "$ACTUAL_COMMIT" = "$OFFICIAL_COMMIT" ] || fail "Expected official commit $OFFICIAL_COMMIT, got $ACTUAL_COMMIT"
-git -C "$VISION_ZERO_REPO" diff --quiet HEAD -- src/open-r1-multimodal \
-  || fail "Official training code/config has local changes; use a clean checkout"
 [ ! -e "$VISION_ZERO_OUTPUT" ] || fail "Output already exists; choose a new VISION_ZERO_OUTPUT to avoid implicit resume"
 
-RUN_NAME="${VISION_ZERO_RUN_NAME:-Qwen2.5-VL-7B-Vision-Zero-aligned}"
-REPORT_TO="${VISION_ZERO_REPORT_TO:-none}"
-# Both sevlm main entry points now share this RL budget. Keep in sync with
-# ours_full_pipeline_train.sh and configs/train_defaults.sh + lib/run_self_evolve.sh.
-# Do not source their launchers: that would activate the main environment/start training.
-# Retain both protocol names as aliases for existing launch commands.
-PROTOCOL="${VISION_ZERO_PROTOCOL:-ours_full_pipeline}"
-case "$PROTOCOL" in
-  ours_full_pipeline|main_ours) DEFAULT_STEPS=240; DEFAULT_G=8; DEFAULT_BATCH=2; DEFAULT_ACCUM=8 ;;
-  *) fail "VISION_ZERO_PROTOCOL must be ours_full_pipeline or main_ours" ;;
-esac
-# Prefix overrides explicitly; unrelated main-run environment variables cannot leak in.
-TRAIN_STEPS="${VISION_ZERO_MAX_STEPS:-$DEFAULT_STEPS}"
-GENERATIONS="${VISION_ZERO_NUM_GENERATIONS:-$DEFAULT_G}"
-DEVICE_BATCH="${VISION_ZERO_PER_DEVICE_BATCH:-$DEFAULT_BATCH}"
-ACCUM="${VISION_ZERO_GRAD_ACCUM:-$DEFAULT_ACCUM}"
-for value in "$TRAIN_STEPS" "$GENERATIONS" "$DEVICE_BATCH" "$ACCUM"; do
-  [[ "$value" =~ ^[1-9][0-9]*$ ]] || fail "Steps, G, batch and accumulation must be positive decimal integers"
+# --- Paper-alignment patch -------------------------------------------------
+# The released code cannot reproduce the paper's stage switching from flags
+# alone: the RAE coefficient is 0.9 rather than Table 5's 0.95, and the
+# threshold/EMA switching of App. A.2.3 is absent (upstream ships a fixed cycle).
+# PATCH_FILE is the ONLY change this launcher is allowed to make to the checkout;
+# any other local modification is refused, so nothing undocumented can slip in.
+# Revert with: git -C "$VISION_ZERO_REPO" checkout -- src/open-r1-multimodal
+PATCH_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/patches/vision_zero_paper_alignment.patch"
+[ -f "$PATCH_FILE" ] || fail "Missing patch file: $PATCH_FILE"
+PATCH_SHA="$(sha256sum "$PATCH_FILE" | cut -d' ' -f1)"
+if git -C "$VISION_ZERO_REPO" diff --quiet HEAD -- src/open-r1-multimodal; then
+  PATCH_STATE="clean"
+  git -C "$VISION_ZERO_REPO" apply --check "$PATCH_FILE" \
+    || fail "Patch does not apply to this checkout; resolve it by hand"
+elif git -C "$VISION_ZERO_REPO" apply --check --reverse "$PATCH_FILE" 2>/dev/null; then
+  PATCH_STATE="applied"
+  APPLIED_SHA="$(git -C "$VISION_ZERO_REPO" diff -- src/open-r1-multimodal | sha256sum | cut -d' ' -f1)"
+  [ "$APPLIED_SHA" = "$PATCH_SHA" ] \
+    || fail "Checkout differs from the recorded patch: diff=$APPLIED_SHA patch=$PATCH_SHA"
+else
+  fail "Official checkout has local changes that are not the paper-alignment patch; refusing to run"
+fi
+
+# --- Training budget -------------------------------------------------------
+# The Vision-Zero paper (arXiv 2509.25541) reports "100 iterations with a batch
+# size of 128" (Table 5), on 8xA100. The repo's own run_grpo_vision_zero.sh says
+# 40 epochs x epoch_size 450, which works out to 280 optimizer steps -- 2.8x the
+# paper. We follow the paper's own number: it is the budget the baseline's
+# published results come from. See ../VISION_ZERO.md.
+STEPS="${VISION_ZERO_MAX_STEPS:-100}"
+EPOCH_SIZE="${VISION_ZERO_EPOCH_SIZE:-450}"
+GENERATIONS="${VISION_ZERO_NUM_GENERATIONS:-8}"
+# Paper lists --per_device_train_batch_size 8, but grpo_trainer.py truncates
+# every micro-batch to its first game ("inputs = [inputs[0]]", "to avoid OOM"),
+# so anything above 1 is generated and then discarded. 8 ranks x 1 game x
+# accum 16 = 128 games per optimizer step, which is the paper's batch size.
+DEVICE_BATCH="${VISION_ZERO_PER_DEVICE_BATCH:-1}"
+ACCUM="${VISION_ZERO_GRAD_ACCUM:-16}"
+LR="${VISION_ZERO_LR:-1e-5}"
+BETA="${VISION_ZERO_BETA:-0.04}"
+SEED="${VISION_ZERO_SEED:-42}"
+# The paper's command, now affordable: 100 steps x ~16 GB per full-model
+# checkpoint means every 5 steps is ~320 GB against ~2.2 TB free.
+SAVE_STEPS="${VISION_ZERO_SAVE_STEPS:-5}"
+# The paper reports to wandb. Checked before launch: if the environment has no
+# credentials this falls back to none rather than hang a 24 h run on a login
+# prompt (the substitution is recorded in official_recipe.txt).
+REPORT_TO="${VISION_ZERO_REPORT_TO:-wandb}"
+RUN_NAME="${VISION_ZERO_RUN_NAME:-Qwen2.5-VL-7B-GRPO-Vision-Zero}"
+
+for value in "$STEPS" "$EPOCH_SIZE" "$GENERATIONS" "$DEVICE_BATCH" "$ACCUM" "$SAVE_STEPS" "$SEED"; do
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || fail "Steps, sizes, G, batch, accumulation, save steps and seed must be positive decimal integers"
 done
-EFFECTIVE_BATCH=$((8 * DEVICE_BATCH * ACCUM))
-[ "$GENERATIONS" -ge 4 ] || fail "Use G >= 4, matching the main training protocol"
-[ $((8 * DEVICE_BATCH % GENERATIONS)) -eq 0 ] || fail "8 * per-device batch must be divisible by G"
-# Match common optimizer/length/pixel settings; retain official rewards, gameplay,
-# advantage computation and CPU-offloaded ZeRO-3. This does NOT equalize total FLOPs.
+[ "$GENERATIONS" -ge 2 ] || fail "num_generations must be at least 2"
+[ $((8 * DEVICE_BATCH % GENERATIONS)) -eq 0 ] || fail "8 * per-device batch must be divisible by num_generations"
+[ "$DEVICE_BATCH" -eq 1 ] || warn "per-device batch $DEVICE_BATCH: only the first game of each micro-batch reaches the gradient (grpo_trainer.py truncates). Set it to 1 to avoid wasted generation."
+NOMINAL_GAMES=$((8 * DEVICE_BATCH * ACCUM))
+ACTUAL_GAMES=$((8 * 1 * ACCUM))
+
+# WandB needs a working client and credentials, and a tmux run cannot answer a
+# login prompt. The env's own wandb (0.18.3) creates a run but uploads no
+# history, so stage the 0.30.0 package the sevlm runs use (WANDB_PKG_DIR, see
+# ours_full_pipeline_train.sh) and log in with WANDB_API_KEY, as that script
+# does. Both are resolved before the command line is built so the substitution
+# is recorded.
+REPORT_TO_NOTE=""
+if [ "$REPORT_TO" = "wandb" ]; then
+  WANDB_PKG_DIR="${WANDB_PKG_DIR:-/tmp/sevlm_wandb_py311}"
+  if [ "${DRY_RUN:-0}" = 1 ]; then
+    echo "[vision-zero] DRY_RUN: not checking wandb credentials (the real run does)"
+  elif [ ! -d "$WANDB_PKG_DIR/wandb" ]; then
+    REPORT_TO_NOTE="W&B package not found at $WANDB_PKG_DIR; fell back to none"
+    echo "[WARN] $REPORT_TO_NOTE" >&2
+    REPORT_TO="none"
+  elif [ -z "${WANDB_API_KEY:-}" ]; then
+    REPORT_TO_NOTE="WANDB_API_KEY is not set; fell back to none"
+    echo "[WARN] $REPORT_TO_NOTE" >&2
+    REPORT_TO="none"
+  else
+    export PYTHONPATH="$WANDB_PKG_DIR${PYTHONPATH:+:$PYTHONPATH}"
+    export WANDB_PROJECT="${WANDB_PROJECT:-self-evolve-vlm}"
+    if "$VISION_ZERO_PY" -m wandb login --relogin "$WANDB_API_KEY" >/dev/null 2>&1; then
+      echo "[vision-zero] wandb logged in from $WANDB_PKG_DIR; project=$WANDB_PROJECT"
+    else
+      REPORT_TO_NOTE="wandb login failed; fell back to none"
+      echo "[WARN] $REPORT_TO_NOTE" >&2
+      REPORT_TO="none"
+    fi
+  fi
+fi
+
+# Do not add --min_pixels/--max_pixels: the paper's command omits them and the
+# entry defaults (3136 / 12845056) are the Qwen2.5-VL values. Smaller values
+# would downscale every image and silently weaken the baseline.
+# --max_prompt_length is accepted but the trainer forces it to None, and the
+# CLEVR interactive path hardcodes max_new_tokens=1024 / temperature=0.8 for
+# its own generations, so --max_completion_length and --temperature never
+# reach them. They are passed only to mirror the paper's command.
 CMD=(
   "$VISION_ZERO_PY" -m torch.distributed.run
   --nproc_per_node=8 --nnodes=1 --node_rank=0
@@ -66,37 +140,51 @@ CMD=(
   --deepspeed "$ZERO_CONFIG"
   --output_dir "$VISION_ZERO_OUTPUT" --model_name_or_path "$VISION_ZERO_MODEL"
   --dataset_name dynamic_clevr_spotdiff --use_dynamic_dataset
-  --epoch_size 450 --data_generator_type clevr_spotdiff
+  --epoch_size "$EPOCH_SIZE" --data_generator_type clevr_spotdiff
   --clevr_images_dir "$IMAGES_DIR" --clevr_scenes_dir "$SCENES_DIR"
   --clevr_num_players 4 --clevr_num_rounds 2
-  --training_phase interactive --interactive_cycle_length 1
-  --data_generator_seed 42 --seed 42 --max_anyres_num 6
-  --max_prompt_length 10240 --max_completion_length 2048
-  --min_pixels 802816 --max_pixels 1003520
+  --training_phase interactive
+  --data_generator_seed "$SEED" --max_anyres_num 6
+  --max_prompt_length 8000 --max_completion_length 512
   --num_generations "$GENERATIONS" --per_device_train_batch_size "$DEVICE_BATCH"
   --gradient_accumulation_steps "$ACCUM" --logging_steps 1
-  --bf16 --torch_dtype bfloat16 --beta 0.06
+  --bf16 --torch_dtype bfloat16 --beta "$BETA"
   --report_to "$REPORT_TO" --gradient_checkpointing true
   --gradient_checkpointing_kwargs '{"use_reentrant": false}'
-  --attn_implementation flash_attention_2 --use_vllm False
-  --max_steps "$TRAIN_STEPS"
-  --learning_rate 1e-6 --warmup_ratio 0.1 --lr_scheduler_type cosine
-  --weight_decay 0.0 --temperature 1.0 --max_grad_norm 0.3
-  --run_name "$RUN_NAME" --save_steps 10 --save_only_model true
+  --attn_implementation flash_attention_2
+  # --use_vllm is omitted: GRPOConfig defaults it to False, as the paper does.
+  # Required: accelerate defaults dispatch_batches=True for IterableDataset,
+  # which concatenates the per-process batches on rank 0. These batches are
+  # dicts holding strings, so that raises TypeError. Upstream passes it too.
+  --dispatch_batches False
+  --max_steps "$STEPS"
+  --learning_rate "$LR" --warmup_ratio 0.1 --lr_scheduler_type cosine
+  --run_name "$RUN_NAME" --save_steps "$SAVE_STEPS" --save_only_model true
   --reward_funcs clevr_clue_format_with_votes clevr_decision_accuracy
   --val_split_ratio 0.0 --num_iterations 1
 )
 
-echo "[vision-zero] official source=$OFFICIAL_COMMIT"
-echo "[vision-zero] protocol=$PROTOCOL; steps=$TRAIN_STEPS; G=$GENERATIONS; per_device_batch=$DEVICE_BATCH; grad_accum=$ACCUM; nominal_effective_batch=$EFFECTIVE_BATCH"
+echo "[vision-zero] official source=$OFFICIAL_COMMIT; alignment patch=$PATCH_SHA ($PATCH_STATE)"
+echo "[vision-zero] recipe=paper (100 iterations, batch 128 games); steps=$STEPS; epoch_size=$EPOCH_SIZE; G=$GENERATIONS; per_device_batch=$DEVICE_BATCH; grad_accum=$ACCUM"
+echo "[vision-zero] games per optimizer step: nominal=$NOMINAL_GAMES actual=$ACTUAL_GAMES; lr=$LR beta=$BETA seed=$SEED; save every $SAVE_STEPS steps; report_to=$REPORT_TO"
 echo "[vision-zero] 8 GPUs; official 4-player gameplay; no sevlm trainer imports"
 printf '%q ' "${CMD[@]}"; printf '\n'
 if [ "${DRY_RUN:-0}" = 1 ]; then
   exit 0
 fi
 
-# Select only the official source, even if this shell previously ran sevlm.
-export PYTHONPATH="$TRAIN_ROOT/src"
+# Apply the paper-alignment patch (dry runs must not mutate the checkout), then
+# confirm the resulting diff is still exactly the recorded patch.
+if [ "$PATCH_STATE" = "clean" ]; then
+  git -C "$VISION_ZERO_REPO" apply "$PATCH_FILE" || fail "Failed to apply $PATCH_FILE"
+  echo "[vision-zero] applied paper-alignment patch $PATCH_SHA"
+fi
+APPLIED_SHA="$(git -C "$VISION_ZERO_REPO" diff -- src/open-r1-multimodal | sha256sum | cut -d' ' -f1)"
+[ "$APPLIED_SHA" = "$PATCH_SHA" ] || fail "Post-apply diff $APPLIED_SHA != recorded patch $PATCH_SHA"
+
+# Select only the official source, even if this shell previously ran sevlm;
+# keep any prefix added above (the staged wandb package) behind it.
+export PYTHONPATH="$TRAIN_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONNOUSERSITE=1
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 IFS=, read -r -a GPU_IDS <<< "$CUDA_VISIBLE_DEVICES"
@@ -104,22 +192,30 @@ IFS=, read -r -a GPU_IDS <<< "$CUDA_VISIBLE_DEVICES"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 unset PYTORCH_ALLOC_CONF
 export DEBUG_MODE=true
+# DeepSpeed has no prebuilt cpu_adam for this env and builds it with the system
+# nvcc (12.9), while torch is cu124, so the op builder's version check aborts
+# the run. cpu_adam is a CPU-only operator compiled with g++; skipping the
+# check is safe and changes nothing about the recipe.
+export DS_SKIP_CUDA_CHECK=1
 mkdir -p "$VISION_ZERO_OUTPUT"
-# Upstream pins gradient_clipping=1.0; HF would reject max_grad_norm=0.3.
-# Write a run-local copy with automatic clipping alignment; never edit upstream.
-"$VISION_ZERO_PY" - "$ZERO_SOURCE" "$ZERO_CONFIG" <<'PY'
-import json, sys
-with open(sys.argv[1]) as source:
-    config = json.load(source)
-config["gradient_clipping"] = "auto"
-with open(sys.argv[2], "w") as output:
-    json.dump(config, output, indent=2)
-PY
 export LOG_PATH="$VISION_ZERO_OUTPUT/debug_log.txt"
 printf '%s\n' "$OFFICIAL_COMMIT" > "$VISION_ZERO_OUTPUT/official_commit.txt"
-printf 'protocol=%s\nmax_steps=%s\nnum_generations=%s\nper_device_batch=%s\ngrad_accum=%s\nnominal_effective_batch=%s\n' \
-  "$PROTOCOL" "$TRAIN_STEPS" "$GENERATIONS" "$DEVICE_BATCH" "$ACCUM" "$EFFECTIVE_BATCH" \
-  > "$VISION_ZERO_OUTPUT/alignment_config.txt"
+printf 'recipe=paper_100_iterations_batch128\nmax_steps=%s\nepoch_size=%s\nnum_generations=%s\nper_device_batch=%s\ngrad_accum=%s\nnominal_games_per_step=%s\nactual_games_per_step=%s\nlearning_rate=%s\nbeta=%s\nseed=%s\nsave_steps=%s\nreport_to=%s\n' \
+  "$STEPS" "$EPOCH_SIZE" "$GENERATIONS" "$DEVICE_BATCH" "$ACCUM" "$NOMINAL_GAMES" "$ACTUAL_GAMES" \
+  "$LR" "$BETA" "$SEED" "$SAVE_STEPS" "$REPORT_TO" \
+  > "$VISION_ZERO_OUTPUT/official_recipe.txt"
+printf 'note=%s\n' "repo run_grpo_vision_zero.sh says 40 epochs = 280 steps; paper reports 100 iterations at batch 128. This run follows the paper." \
+  >> "$VISION_ZERO_OUTPUT/official_recipe.txt"
+[ "$REPORT_TO" = "wandb" ] && printf 'wandb_pkg_dir=%s\nwandb_project=%s\n' \
+  "$WANDB_PKG_DIR" "$WANDB_PROJECT" >> "$VISION_ZERO_OUTPUT/official_recipe.txt"
+[ -n "$REPORT_TO_NOTE" ] && printf 'report_to_note=%s\n' "$REPORT_TO_NOTE" >> "$VISION_ZERO_OUTPUT/official_recipe.txt"
+{
+  printf 'patch_file=%s\n' "$PATCH_FILE"
+  printf 'patch_sha256=%s\n' "$PATCH_SHA"
+  printf 'checkout_diff_sha256=%s\n' "$APPLIED_SHA"
+  printf 'base_commit=%s\n' "$OFFICIAL_COMMIT"
+  printf 'revert=%s\n' "git -C $VISION_ZERO_REPO checkout -- src/open-r1-multimodal"
+} > "$VISION_ZERO_OUTPUT/paper_alignment_patch.txt"
 printf '%q ' "${CMD[@]}" > "$VISION_ZERO_OUTPUT/launch_command.txt"
 printf '\n' >> "$VISION_ZERO_OUTPUT/launch_command.txt"
 cd "$TRAIN_ROOT"

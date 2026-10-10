@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
 # ours（完整方法）单文件全链路训练脚本 —— 自包含版
-#
-# 这是新库 experiments/main/ours.sh 的「摊平」版本：把原本拆在
-#   main/ours.sh  ->  lib/run_self_evolve.sh  ->  lib/common.sh
-#                                              ->  paths.sh
-#                                              ->  configs/train_defaults.sh
 # 用法（建议 tmux）：
 #   tmux new -s ours
 #   bash local_scripts/self_evolve/experiments/ours_full_pipeline_train.sh
@@ -22,9 +17,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REPO:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
 WORKSPACE="${WORKSPACE:-$REPO}"
 
-# --- 已有 conda 环境 ---
-CONDA_BASE="${CONDA_BASE:-}"
-CONDA_ENV="${CONDA_ENV:-easy-r1}"
+# --- 已有 conda 环境（本机 sevlm；CONDA_BASE= 置空则沿用当前环境）---
+CONDA_BASE="${CONDA_BASE:-/jizhicfs/rtliu/miniconda3}"
+CONDA_ENV="${CONDA_ENV:-sevlm}"
 WANDB_PKG_DIR="${WANDB_PKG_DIR:-/tmp/sevlm_wandb_py311}"
 if [ -n "$CONDA_BASE" ] && [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
   # shellcheck disable=SC1091
@@ -41,9 +36,9 @@ if [ ! -x "$PY" ]; then
   echo "[WARN] requested Python is unavailable; using $PY." >&2
 fi
 
-DATASET_ROOT="${DATASET_ROOT:-$WORKSPACE/data/Vision-Zero-clevr-dataset}"
-BASE_MODEL="${BASE_MODEL:-$WORKSPACE/models/Qwen2.5-VL-7B-Instruct}"
-RUNS_ROOT="${RUNS_ROOT:-$WORKSPACE/self_evolve_runs}"
+DATASET_ROOT="${DATASET_ROOT:-/jizhicfs/rtliu/data/Vision-Zero-clevr-dataset}"
+BASE_MODEL="${BASE_MODEL:-/jizhicfs/rtliu/models/Qwen2.5-VL-7B-Instruct}"
+RUNS_ROOT="${RUNS_ROOT:-/jizhicfs/rtliu/self_evolve_runs}"
 
 export PYTHONPATH="$REPO/src:${PYTHONPATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -78,10 +73,10 @@ export REFERENCE_VLM_BASE_URL REFERENCE_VLM_API_KEY REFERENCE_VLM_MODEL \
 # =============================================================================
 # 3) 超参（原 train_defaults.sh）。每项都可用 env 覆盖。
 # =============================================================================
-LOOP_ITERATIONS="${LOOP_ITERATIONS:-1}"                # self-evolve 轮数（出题-筛选-解题-打分-训练）
-GRPO_STEPS_PER_ITER="${GRPO_STEPS_PER_ITER:-240}"       # 每轮 GRPO 步数
+LOOP_ITERATIONS="${LOOP_ITERATIONS:-5}"                # self-evolve 轮数（出题-筛选-解题-打分-训练）
+GRPO_STEPS_PER_ITER="${GRPO_STEPS_PER_ITER:-80}"       # 每轮 GRPO 步数
 MAIN_NUM_GENERATIONS="${MAIN_NUM_GENERATIONS:-8}"      # GRPO group size / solver rollout n
-MAIN_NUM_TRAIN_TASKS="${MAIN_NUM_TRAIN_TASKS:-256}"     # 每轮筛选前生成的候选题目数
+MAIN_NUM_TRAIN_TASKS="${MAIN_NUM_TRAIN_TASKS:-128}"     # 每轮筛选前生成的候选题目数
 # 每题给几张图。对齐 baseline 的 NUM_PLAYERS=3
 NUM_PLAYERS="${NUM_PLAYERS:-3}"
 
@@ -162,7 +157,7 @@ SOLVER_TOP_P="${SOLVER_TOP_P:-0.95}"
 # non-reentrant checkpointing：8 卡 DDP 下 reentrant 会把同一参数 mark ready 两次。
 GC_KWARGS="${GC_KWARGS:---gradient_checkpointing_kwargs '{\"use_reentrant\": false}'}"
 CLIP="${CLIP:---max_grad_norm 0.3}"                     # 梯度裁剪，防 bf16 全参 grad_norm 突然 nan 打崩权重
-SAVE_STEPS="${SAVE_STEPS:-40}"
+SAVE_STEPS="${SAVE_STEPS:-20}"
 
 # ---- 组装各阶段透传串（主入口把这些 append 到各自命令末尾，覆盖内置默认）----
 GRPO_STEPS_ARG=""; [ -n "${GRPO_MAX_STEPS:-}" ] && GRPO_STEPS_ARG="--max_steps $GRPO_MAX_STEPS"

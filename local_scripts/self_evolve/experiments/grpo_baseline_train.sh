@@ -21,9 +21,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REPO:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
 WORKSPACE="${WORKSPACE:-$REPO}"
 
-# --- conda 环境 ---
-CONDA_BASE="${CONDA_BASE:-}"
-CONDA_ENV="${CONDA_ENV:-easy-r1}"
+# --- conda 环境（本机 sevlm；CONDA_BASE= 置空则沿用当前环境）---
+CONDA_BASE="${CONDA_BASE:-/jizhicfs/rtliu/miniconda3}"
+CONDA_ENV="${CONDA_ENV:-sevlm}"
 WANDB_PKG_DIR="${WANDB_PKG_DIR:-/tmp/sevlm_wandb_py311}"
 if [ -n "$CONDA_BASE" ] && [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
   # shellcheck disable=SC1091

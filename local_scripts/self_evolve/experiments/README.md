@@ -27,7 +27,7 @@ E=local_scripts/self_evolve/experiments
 |---|---|
 | base zero-shot | `main/base_zeroshot.sh` |
 | base + GRPO | `main/grpo_baseline.sh` |
-| base + vision-zero (official implementation, aligned settings) | `main/vision_zero_baseline.sh` — [separate setup](VISION_ZERO.md) |
+| base + vision-zero (official implementation and recipe) | `main/vision_zero_baseline.sh` — [separate setup](VISION_ZERO.md) |
 | base + ours | `main/ours.sh` |
 | base + ours + verified visual facts (experimental) | `main/ours_visual_facts.sh` |
 | base + visual facts + visual curriculum (experimental) | `main/ours_visual_curriculum.sh` — [research and ablations](VISUAL_CURRICULUM.md) |
@@ -45,12 +45,26 @@ For experiment 3, follow [VISION_ZERO.md](VISION_ZERO.md) to set the official
 checkout, Python, model, data and output paths, then run
 `bash $E/main/vision_zero_baseline.sh`. It does not use the shared training
 defaults or create a `vision_zero` marker. Evaluate its explicit output model
-path under the same evaluation protocol used for all five rows. By default,
-the launcher aligns total GRPO steps and common settings with
-`ours_full_pipeline_train.sh` (240 steps, G=8, nominal batch=128).
-`main/ours.sh` now shares that RL budget; `VISION_ZERO_PROTOCOL=main_ours`
-is retained as an alias with the same defaults. Neither profile equates total generated
-tokens/FLOPs across the two methods. See [EVAL_DATASETS.md](EVAL_DATASETS.md)
+path under the same evaluation protocol used for all five rows. The launcher
+runs the official implementation at the training budget the VISION-ZERO paper
+reports (100 iterations, batch 128 games, lr 1e-5, beta 0.04, official ZeRO
+config), so it is deliberately NOT bound by `configs/train_defaults.sh`: a paper
+baseline is most defensible on its published configuration, and mixing in ours'
+learning rate and beta would invite exactly the wrong reviewer question. Note
+the repo's own `run_grpo_vision_zero.sh` asks for 40 epochs, which the data
+pipeline turns into 280 optimizer steps -- 2.8x the paper -- so the two "official"
+budgets disagree and VISION_ZERO.md explains why the paper's wins. It does not
+equate generated tokens/FLOPs with the other rows either; report the actual
+step counts.
+
+Experiment 3 is also the one row that patches upstream code:
+`patches/vision_zero_paper_alignment.patch` implements the paper's stage
+switching (RAE alpha 0.95, the rho=0.95 accuracy/"n/a" EMAs, the threshold
+hysteresis and its dwell gate), because the released code cannot produce it from
+flags alone. The launcher accepts only a clean checkout or exactly that patch,
+records both hashes in the run directory, and `patches/revert_vision_zero_patch.sh`
+restores upstream. Do not hand-edit the official checkout; see VISION_ZERO.md.
+See [EVAL_DATASETS.md](EVAL_DATASETS.md)
 for the shared nine-benchmark evaluation entry point and dataset names.
 
 `ours_no_self_play` is the row that says what the proposing side is worth:

@@ -127,14 +127,27 @@ export SELF_EVOLVE_SFT_EXTRA_ARGS="$SFT_EXTRA"
 # --- wandb training curves (off by default; WANDB=1 enables) ---
 # When on, the GRPO/SFT trainers report to wandb (standard TRL curves:
 # loss/lr/grad_norm/reward). Loop-level signals (reward_std /
-# bbox_valid_rate etc.) stay in run.log. Needs WANDB_API_KEY (in .env, or
-# `wandb login` first).
+# bbox_valid_rate etc.) stay in run.log. Logs in on every launch (same
+# fail-hard recipe as the standalone experiments/ours_full_pipeline_train.sh);
+# needs WANDB_API_KEY (in .env or the environment).
 if [ "${WANDB:-0}" = "1" ]; then
+  # The conda env's bundled wandb is unusable on this machine; login and
+  # trainer both load the staged package.
+  WANDB_PKG_DIR="${WANDB_PKG_DIR:-/tmp/sevlm_wandb_py311}"
+  [ -d "$WANDB_PKG_DIR/wandb" ] || {
+    echo "[ERROR] W&B package not found: $WANDB_PKG_DIR/wandb" >&2
+    exit 2
+  }
+  export PYTHONPATH="$WANDB_PKG_DIR:$PYTHONPATH"
   export SELF_EVOLVE_REPORT_TO=wandb
   export WANDB_PROJECT="${WANDB_PROJECT:-self-evolve-vlm}"
   export WANDB_NAME="${WANDB_NAME:-ours_${NUM_ITERATIONS}iters_${MAX_STEPS}step}"
-  : "${WANDB_API_KEY:?WANDB=1 needs WANDB_API_KEY (put it in $ENV_FILE or run wandb login first)}"
-  echo "[wandb] project=$WANDB_PROJECT name=$WANDB_NAME"
+  : "${WANDB_API_KEY:?WANDB=1 needs WANDB_API_KEY (put it in $ENV_FILE or the environment)}"
+  "$PY" -m wandb login --relogin "$WANDB_API_KEY" || {
+    echo "[ERROR] W&B login failed; refusing to start an untracked training run." >&2
+    exit 2
+  }
+  echo "[wandb] logged in (package=$WANDB_PKG_DIR) project=$WANDB_PROJECT name=$WANDB_NAME"
 else
   export SELF_EVOLVE_REPORT_TO=none
 fi

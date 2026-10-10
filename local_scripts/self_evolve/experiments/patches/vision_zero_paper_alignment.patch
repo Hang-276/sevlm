@@ -1,0 +1,312 @@
+diff --git a/src/open-r1-multimodal/src/open_r1/clevr_spotdiff_generator.py b/src/open-r1-multimodal/src/open_r1/clevr_spotdiff_generator.py
+index 6c08685..51abb1d 100644
+--- a/src/open-r1-multimodal/src/open_r1/clevr_spotdiff_generator.py
++++ b/src/open-r1-multimodal/src/open_r1/clevr_spotdiff_generator.py
+@@ -29,7 +29,7 @@ class CLEVRSpotDiffGenerator:
+         # Role advantage baselines for adaptive reward shaping
+         self.b_spy = 0.0      # 卧底角色平均得分基线
+         self.b_civ = 0.0      # 平民角色平均得分基线  
+-        self.alpha = 0.9      # EMA 衰减系数
++        self.alpha = 0.95     # EMA 衰减系数 (Vision-Zero paper Table 5; upstream had 0.9)
+         self.baseline_lock = None  # 用于多GPU同步的锁（如果需要的话）
+         
+         # 统计信息（用于调试）
+@@ -1681,6 +1681,20 @@ def _calculate_strategic_clue_rewards(game_data, all_votes, num_players, beta=0.
+     civilian_raw_rewards = [rewards[i] for i in range(len(rewards)) if i != spy_player - 1]
+     civilian_raw_mean = sum(civilian_raw_rewards) / len(civilian_raw_rewards) if civilian_raw_rewards else 0.0
+     
++    # Stage-switch statistics from the Vision-Zero paper (arXiv 2509.25541,
++    # Alg. A.2.3): acc_t averages 1[argmax_y q_theta(y|H) == spy] over the batch,
++    # na_t averages q_theta(empty vote). The code has no explicit distribution
++    # over {players, empty}, so the G sampled decision votes stand in for
++    # q_theta: argmax is the majority vote, and the "n/a" rate is the fraction of
++    # votes that chose the empty option.
++    decision_votes_cast = na_votes + total_god_voters + invalid_votes
++    if total_god_voters > 0:
++        argmax_voted_spy = max(vote_counts, key=lambda player: vote_counts[player])
++        decision_correct = 1.0 if argmax_voted_spy == spy_player else 0.0
++    else:
++        decision_correct = 0.0  # no valid vote, so no correct identification
++    decision_na_rate = na_votes / decision_votes_cast if decision_votes_cast > 0 else 0.0
++
+     # Initialize metrics dictionary
+     metrics = {
+         'spy_raw_reward': spy_raw_reward,
+@@ -1690,7 +1704,10 @@ def _calculate_strategic_clue_rewards(game_data, all_votes, num_players, beta=0.
+         'civilian_votes_avg': v_C_bar,
+         'total_valid_votes': total_god_voters,
+         'na_votes': na_votes,
+-        'invalid_votes': invalid_votes
++        'invalid_votes': invalid_votes,
++        'decision_correct': decision_correct,
++        'decision_na_rate': decision_na_rate,
++        'decision_votes_cast': decision_votes_cast
+     }
+     
+     # Apply role advantage adjustment if enabled and generator is provided
+diff --git a/src/open-r1-multimodal/src/open_r1/trainer/grpo_trainer.py b/src/open-r1-multimodal/src/open_r1/trainer/grpo_trainer.py
+index 9a6df66..a691995 100644
+--- a/src/open-r1-multimodal/src/open_r1/trainer/grpo_trainer.py
++++ b/src/open-r1-multimodal/src/open_r1/trainer/grpo_trainer.py
+@@ -196,6 +196,84 @@ class CyclicRepeatSampler(Sampler):
+         return num_complete_batches * self.batch_size * self.mini_repeat_count * self.cycle_length
+ 
+ 
++class VisionZeroStageSwitcher:
++    """Stage switching for Vision-Zero (arXiv 2509.25541, App. A.2.3).
++
++    Upstream cycles the decision/clue stage on a fixed schedule
++    (`global_step % (interactive_cycle_length * 2)`). The paper instead switches on
++    smoothed statistics of the decision stage:
++
++        acc_bar <- RHO * acc_bar + (1 - RHO) * acc_t
++        na_bar  <- RHO * na_bar  + (1 - RHO) * na_t
++
++        decision -> clue:  acc_bar >= TAU_ACC_UP and na_bar <= TAU_NA_DOWN
++        clue -> decision:  (1 - acc_bar) >= TAU_ERR_UP or na_bar >= TAU_NA_UP
++
++    both gated by a minimum dwell time K_MIN, with the dwell counter reset on every
++    switch. b_s, b_civ, acc_bar and na_bar are never reset; the run starts in the
++    decision stage.
++
++    Table 5 also lists a patience P ("number of rounds before forcing change") that
++    the paper's pseudocode never references. PATIENCE below implements the literal
++    reading of Table 5 -- force a switch after P rounds without a threshold
++    trigger; None disables it.
++    """
++
++    RHO = 0.95
++    TAU_ACC_UP = 0.9
++    TAU_ERR_UP = 0.4
++    TAU_NA_UP = 0.5
++    TAU_NA_DOWN = 0.1
++    K_MIN = 5
++    PATIENCE = 20
++
++    def __init__(self, rho=None, tau_acc_up=None, tau_err_up=None, tau_na_up=None,
++                 tau_na_down=None, k_min=None, patience="default"):
++        if rho is not None:
++            self.RHO = rho
++        if tau_acc_up is not None:
++            self.TAU_ACC_UP = tau_acc_up
++        if tau_err_up is not None:
++            self.TAU_ERR_UP = tau_err_up
++        if tau_na_up is not None:
++            self.TAU_NA_UP = tau_na_up
++        if tau_na_down is not None:
++            self.TAU_NA_DOWN = tau_na_down
++        if k_min is not None:
++            self.K_MIN = k_min
++        if patience != "default":
++            self.PATIENCE = patience
++        self.stage = 0          # m: 0 = decision, 1 = clue
++        self.acc_bar = 0.0
++        self.na_bar = 0.0
++        self.dwell = 0          # d
++        self.updates = 0
++
++    def update(self, acc_t: float, na_t: float):
++        """Advance one iteration. Returns (stage, switched, reason)."""
++        self.acc_bar = self.RHO * self.acc_bar + (1.0 - self.RHO) * acc_t
++        self.na_bar = self.RHO * self.na_bar + (1.0 - self.RHO) * na_t
++        self.dwell += 1
++        self.updates += 1
++
++        switched = False
++        reason = ""
++        if self.dwell >= self.K_MIN:
++            if self.stage == 0:
++                if self.acc_bar >= self.TAU_ACC_UP and self.na_bar <= self.TAU_NA_DOWN:
++                    switched, reason = True, "acc_bar>=tau_acc_up and na_bar<=tau_na_down"
++            else:
++                if (1.0 - self.acc_bar) >= self.TAU_ERR_UP or self.na_bar >= self.TAU_NA_UP:
++                    switched, reason = True, "err_bar>=tau_err_up or na_bar>=tau_na_up"
++        if not switched and self.PATIENCE is not None and self.dwell >= self.PATIENCE:
++            switched, reason = True, "patience P=%s" % self.PATIENCE
++
++        if switched:
++            self.stage = 1 - self.stage
++            self.dwell = 0
++        return self.stage, switched, reason
++
++
+ class VLMGRPOTrainer(Trainer):
+     """
+     Trainer for the Group Relative Policy Optimization (GRPO) method. This algorithm was initially proposed in the
+@@ -482,6 +560,16 @@ class VLMGRPOTrainer(Trainer):
+ 
+         # Initialize the metrics
+         self._metrics = defaultdict(list)
++
++        # Vision-Zero paper alignment (arXiv 2509.25541, App. A.2.3): the stage is
++        # chosen from smoothed decision statistics instead of a fixed cycle.
++        # VZ_STAGE_SWITCH=cycle restores the upstream fixed-cycle behaviour.
++        self._vz_stage_switch_mode = os.environ.get("VZ_STAGE_SWITCH", "paper").strip().lower()
++        self._vz_switcher = VisionZeroStageSwitcher()
++        self._vz_last_step = None
++        self._vz_acc_sum = 0.0
++        self._vz_na_sum = 0.0
++        self._vz_acc_n = 0
+         
+         # Store script_args for later access
+         self.script_args = script_args
+@@ -894,6 +982,54 @@ class VLMGRPOTrainer(Trainer):
+             "multimodal_inputs": multimodal_inputs
+         }
+ 
++    def _vz_stage_name(self) -> str:
++        return "clue" if self._vz_switcher.stage == 1 else "decision"
++
++    def _vz_update_stage(self):
++        """Advance the paper's stage switch, once per optimizer step.
++
++        `compute_loss` runs once per micro-batch, so the accumulators below are
++        filled `gradient_accumulation_steps` times per optimizer step while
++        `state.global_step` stays constant. Finalising when the step number
++        changes makes t -- the paper's iteration -- equal one optimizer step.
++        """
++        step = self.state.global_step
++        if self._vz_last_step is None:
++            self._vz_last_step = step
++            return
++        if step == self._vz_last_step:
++            return
++
++        n = max(1, self._vz_acc_n)
++        acc_t = self._vz_acc_sum / n
++        na_t = self._vz_na_sum / n
++        # Mirror apply_unified_role_advantage_adjustment: one mean-reduce per
++        # scalar, so every rank holds identical statistics and switches together.
++        device = self.accelerator.device
++        acc_t = self.accelerator.reduce(torch.tensor(acc_t, device=device), reduction="mean").item()
++        na_t = self.accelerator.reduce(torch.tensor(na_t, device=device), reduction="mean").item()
++
++        stage, switched, reason = self._vz_switcher.update(acc_t, na_t)
++        self._vz_last_step = step
++        self._vz_acc_sum = 0.0
++        self._vz_na_sum = 0.0
++        self._vz_acc_n = 0
++
++        self._metrics["vz_acc_t"].append(acc_t)
++        self._metrics["vz_na_t"].append(na_t)
++        self._metrics["vz_acc_bar"].append(self._vz_switcher.acc_bar)
++        self._metrics["vz_na_bar"].append(self._vz_switcher.na_bar)
++        self._metrics["vz_stage"].append(float(stage))
++        self._metrics["vz_dwell"].append(float(self._vz_switcher.dwell))
++
++        if self.accelerator.process_index == 0:
++            print(
++                f"[VZ SWITCH] step={step} micro_batches={n} acc_t={acc_t:.4f} na_t={na_t:.4f} "
++                f"acc_bar={self._vz_switcher.acc_bar:.4f} na_bar={self._vz_switcher.na_bar:.4f} "
++                f"dwell={self._vz_switcher.dwell} -> {self._vz_stage_name()}"
++                + (f"  SWITCHED ({reason})" if switched else "")
++            )
++
+     def _handle_clevr_spotdiff_training(self, inputs: list[dict], model) -> dict:
+         """
+         Handle two-phase training for CLEVR spot-the-difference game:
+@@ -909,24 +1045,32 @@ class VLMGRPOTrainer(Trainer):
+         # Get training phase from script_args
+         base_training_phase = getattr(self.script_args, 'training_phase', 'both')
+         
+-        # Handle interactive training mode (step-based only)
++        # Handle interactive training mode
+         if base_training_phase == 'interactive':
+-            # Get configurable cycle length (in steps)
+-            interactive_cycle_length = getattr(self.script_args, 'interactive_cycle_length', 10)
+-            
+-            # Direct step-based cycling
+-            current_step = self.state.global_step
+-            total_cycle_length = interactive_cycle_length * 2  # Full cycle = decision + clue phases
+-            cycle_position = current_step % total_cycle_length
+-            
+-            if cycle_position < interactive_cycle_length:
+-                training_phase = 'decision'  # First half of cycle
++            if self._vz_stage_switch_mode == 'paper':
++                # Paper stage switching: advance the statistics once per optimizer
++                # step, then train this step's batch in the resulting stage.
++                self._vz_update_stage()
++                training_phase = self._vz_stage_name()
++                if self.accelerator.process_index == 0:
++                    print(f"[INTERACTIVE MODE] paper stage switch: active_phase={training_phase} "
++                          f"acc_bar={self._vz_switcher.acc_bar:.4f} na_bar={self._vz_switcher.na_bar:.4f} "
++                          f"dwell={self._vz_switcher.dwell}")
+             else:
+-                training_phase = 'clue'      # Second half of cycle
+-            
+-            if self.accelerator.process_index == 0:
+-                print(f"[INTERACTIVE MODE] Cycle length: {interactive_cycle_length} steps per phase")
+-                print(f"[INTERACTIVE MODE] Current step: {current_step}, Cycle position: {cycle_position}/{total_cycle_length}, Active phase: {training_phase}")
++                # Upstream fixed cycle, retained for A/B runs (VZ_STAGE_SWITCH=cycle).
++                interactive_cycle_length = getattr(self.script_args, 'interactive_cycle_length', 10)
++                current_step = self.state.global_step
++                total_cycle_length = interactive_cycle_length * 2  # Full cycle = decision + clue phases
++                cycle_position = current_step % total_cycle_length
++
++                if cycle_position < interactive_cycle_length:
++                    training_phase = 'decision'  # First half of cycle
++                else:
++                    training_phase = 'clue'      # Second half of cycle
++
++                if self.accelerator.process_index == 0:
++                    print(f"[INTERACTIVE MODE] Cycle length: {interactive_cycle_length} steps per phase")
++                    print(f"[INTERACTIVE MODE] Current step: {current_step}, Cycle position: {cycle_position}/{total_cycle_length}, Active phase: {training_phase}")
+         else:
+             training_phase = base_training_phase
+         
+@@ -952,13 +1096,17 @@ class VLMGRPOTrainer(Trainer):
+         if self.state.global_step % self.num_iterations == 0:
+             if self.accelerator.process_index == 0:
+                 if base_training_phase == 'interactive':
+-                    interactive_cycle_length = getattr(self.script_args, 'interactive_cycle_length', 10)
+                     current_step = self.state.global_step
+-                    total_cycle_length = interactive_cycle_length * 2
+-                    cycle_position = current_step % total_cycle_length
+                     print(f"=== CLEVR Interactive Training: Currently in {training_phase.upper()} Phase ===")
+-                    print(f"[DEBUG] Step {current_step}, Cycle position {cycle_position}/{total_cycle_length}, Active phase: {training_phase}")
+-                    print(f"[DEBUG] Cycle length: {interactive_cycle_length} steps per phase")
++                    if self._vz_stage_switch_mode == 'paper':
++                        print(f"[DEBUG] Step {current_step}, paper stage switch: acc_bar={self._vz_switcher.acc_bar:.4f} "
++                              f"na_bar={self._vz_switcher.na_bar:.4f} dwell={self._vz_switcher.dwell}")
++                    else:
++                        interactive_cycle_length = getattr(self.script_args, 'interactive_cycle_length', 10)
++                        total_cycle_length = interactive_cycle_length * 2
++                        cycle_position = current_step % total_cycle_length
++                        print(f"[DEBUG] Step {current_step}, Cycle position {cycle_position}/{total_cycle_length}, Active phase: {training_phase}")
++                        print(f"[DEBUG] Cycle length: {interactive_cycle_length} steps per phase")
+                 else:
+                     print(f"=== CLEVR Two-Phase Training: {training_phase.upper()} Phase ===")
+                 print(f"[DEBUG] Will process {len(inputs)} games")
+@@ -2018,6 +2166,14 @@ class VLMGRPOTrainer(Trainer):
+             # Log aggregated clue metrics
+             for metric_name, metric_value in aggregated_metrics.items():
+                 self._metrics[metric_name].append(metric_value)
++
++            # Vision-Zero paper alignment: feed this micro-batch's decision
++            # statistics into the per-optimizer-step stage switch (see
++            # _vz_update_stage).
++            if 'clue_decision_correct' in aggregated_metrics:
++                self._vz_acc_sum += aggregated_metrics['clue_decision_correct']
++                self._vz_na_sum += aggregated_metrics['clue_decision_na_rate']
++                self._vz_acc_n += 1
+             
+             if self.accelerator.process_index == 0:
+                 print(f"[CLUE METRICS] Logged {len(aggregated_metrics)} aggregated metrics to wandb:")
+@@ -3712,8 +3868,16 @@ class VLMGRPOTrainer(Trainer):
+             # - Clue phase training (always immediate processing)  
+             # - Decision phase when min_effective_games <= 1 or threshold reached
+             
+-            # Get training phase information
++            # Get training phase information.
++            # Vision-Zero paper alignment: reading script_args here always yields
++            # the literal 'interactive', which used to fall through to "train
++            # every sample" and made the phase mask below dead code -- so in a
++            # clue stage the god_decision_for_clue_reward samples still received
++            # gradients. The paper applies L_t = m_t*L_clue + (1-m_t)*L_dec, so
++            # resolve the runtime stage instead.
+             training_phase = getattr(self.script_args, 'training_phase', 'both')
++            if training_phase == 'interactive' and self._vz_stage_switch_mode == 'paper':
++                training_phase = self._vz_stage_name()
+             phase_labels = processed_inputs.get("phase_labels", [])
+             
+             # Filter samples based on training phase

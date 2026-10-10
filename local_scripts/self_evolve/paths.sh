@@ -9,9 +9,10 @@
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 WORKSPACE="${WORKSPACE:-$REPO}"
 
-# --- Use the active environment; activate only an explicit Conda installation. ---
-CONDA_BASE="${CONDA_BASE:-}"
-CONDA_ENV="${CONDA_ENV:-easy-r1}"
+# --- Training env on this machine. Set CONDA_BASE= (empty) to keep whatever
+# environment is already active instead. ---
+CONDA_BASE="${CONDA_BASE:-/jizhicfs/rtliu/miniconda3}"
+CONDA_ENV="${CONDA_ENV:-sevlm}"
 if [ -n "$CONDA_BASE" ] && [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
   # shellcheck disable=SC1091
   source "$CONDA_BASE/etc/profile.d/conda.sh"
@@ -32,12 +33,12 @@ fi
 # the directory should contain output/CLEVR_scenes.json.
 # Source (HF): https://huggingface.co/datasets/Qinsi1/Vision-Zero-clevr-dataset
 # Point this at the top-level directory (the parent of output/, not output/).
-DATASET_ROOT="${DATASET_ROOT:-$WORKSPACE/data/Vision-Zero-clevr-dataset}"
+DATASET_ROOT="${DATASET_ROOT:-/jizhicfs/rtliu/data/Vision-Zero-clevr-dataset}"
 
 # --- Base solver model ---
 # TODO placeholder: Qwen2.5-VL-7B-Instruct
 # Source (HF): https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct
-BASE_MODEL="${BASE_MODEL:-$WORKSPACE/models/Qwen2.5-VL-7B-Instruct}"
+BASE_MODEL="${BASE_MODEL:-/jizhicfs/rtliu/models/Qwen2.5-VL-7B-Instruct}"
 
 # --- Output root (each run creates a <RUN_TAG>/ subdirectory under it) ---
 RUNS_ROOT="${RUNS_ROOT:-$WORKSPACE/runs}"

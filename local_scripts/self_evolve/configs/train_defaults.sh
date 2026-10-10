@@ -74,7 +74,8 @@
 # here, the table is comparing training budget or adaptation method, not the
 # method itself. Ablations may of course override them.
 # RL budget matches experiments/ours_full_pipeline_train.sh.
-# Keep these defaults and main/vision_zero_baseline.sh in sync.
+# Experiment 3 (main/vision_zero_baseline.sh) is deliberately NOT bound by
+# these: as a paper baseline it runs the official Vision-Zero recipe instead.
 : "${LOOP_ITERATIONS:=2}"                                        # self-evolve rounds
 : "${GRPO_STEPS_PER_ITER:=120}"                                  # GRPO steps per round
 : "${TOTAL_GRPO_STEPS:=$((LOOP_ITERATIONS * GRPO_STEPS_PER_ITER))}"  # what a single-round exp must match
